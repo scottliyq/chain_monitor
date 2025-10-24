@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-Concrete_STABLE = "0x6503de9FE77d256d9d823f2D335Ce83EcE9E153f"
+
 
 # USDT 合约地址 (ERC-20)
 USDT_CONTRACT_ADDRESS = "0xdAC17F958D2ee523a2206206994597C13D831ec7"

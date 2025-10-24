@@ -1,0 +1,56 @@
+dependencies:
+  - OpenZeppelin/openzeppelin-contracts@4.8.0
+
+compiler:
+  solc:
+    version: 0.8.19
+    optimizer:
+      enabled: true
+      runs: 200
+
+networks:
+  default: mainnet
+  development:
+    host: http://127.0.0.1:8545
+    gas_limit: 6721975
+    gas_buffer: 1.1
+    gas_price: 20000000000
+  mainnet:
+    host: ${WEB3_INFURA_PROJECT_ID}
+    gas_limit: 6721975
+    gas_buffer: 1.1
+    gas_price: auto
+    max_fee: 50 gwei
+    priority_fee: 2 gwei
+  mainnet-fork:
+    host: http://127.0.0.1:8545
+    gas_limit: 6721975
+    gas_buffer: 1.1
+    gas_price: 20000000000
+    fork: mainnet
+  goerli:
+    host: https://goerli.infura.io/v3/${WEB3_INFURA_PROJECT_ID}
+    gas_limit: 6721975
+    gas_buffer: 1.1
+    gas_price: 20000000000
+  sepolia:
+    host: https://sepolia.infura.io/v3/${WEB3_INFURA_PROJECT_ID}
+    gas_limit: 6721975
+    gas_buffer: 1.1
+    gas_price: 20000000000
+  polygon-main:
+    host: https://polygon-mainnet.infura.io/v3/${WEB3_INFURA_PROJECT_ID}
+    gas_limit: 6721975
+    gas_buffer: 1.1
+    gas_price: 30000000000
+  arbitrum-main:
+    host: https://arbitrum-mainnet.infura.io/v3/${WEB3_INFURA_PROJECT_ID}
+    gas_limit: 6721975
+    gas_buffer: 1.1
+    gas_price: auto
+
+dotenv: .env
+
+wallets:
+  from_key: ${PRIVATE_KEY}
+  from_mnemonic: ${MNEMONIC}
