@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Concrete_STABLE 合约交互工具
+Concrete_STABLE 合约交互工具 v2
 支持真实签名模式和mock模式（Impersonate）
-从.env文件读取配置，与代理合约交互执行USDT授权和存款操作
+动态获取合约ABI，使用ERC4626标准的deposit(uint256 assets, address receiver)方法
 """
 
 import sys
@@ -11,13 +11,14 @@ from web3 import Web3
 from decimal import Decimal
 import json
 import time
+import requests
 from dotenv import load_dotenv
 from eth_account import Account
 
 # 加载环境变量
 load_dotenv()
 
-class ConcreteStableInteraction:
+class ConcreteStableInteractionV2:
     def __init__(self, mock_mode=False):
         """初始化合约交互器
         
@@ -30,6 +31,10 @@ class ConcreteStableInteraction:
         
         # 模式设置
         self.mock_mode = mock_mode
+        
+        # Etherscan API配置
+        self.etherscan_api_key = os.getenv('ETHERSCAN_API_KEY', 'YourApiKeyToken')
+        self.etherscan_api_url = "https://api.etherscan.io/api"
         
         # 从环境变量获取配置
         if mock_mode:
@@ -57,9 +62,13 @@ class ConcreteStableInteraction:
         self.web3 = None
         self.usdt_contract = None
         self.concrete_contract = None
+        self.concrete_abi = None
+        self.usdt_abi = None
+        
         self._init_web3()
         
-        # 合约ABI
+        # 动态获取合约ABI并初始化合约
+        self._get_contract_abis()
         self._init_contracts()
         
         # 如果是mock模式，启用impersonate
@@ -146,10 +155,37 @@ class ConcreteStableInteraction:
         except Exception as e:
             raise Exception(f"❌ Web3连接失败: {e}")
     
-    def _init_contracts(self):
-        """初始化合约实例"""
-        # USDT合约ABI (ERC20基本功能)
-        self.usdt_abi = [
+    def _get_contract_abi(self, contract_address, contract_name=""):
+        """从Etherscan获取合约ABI"""
+        try:
+            print(f"🔍 正在获取{contract_name}合约ABI: {contract_address}")
+            
+            params = {
+                'module': 'contract',
+                'action': 'getabi',
+                'address': contract_address,
+                'apikey': self.etherscan_api_key
+            }
+            
+            response = requests.get(self.etherscan_api_url, params=params, timeout=10)
+            data = response.json()
+            
+            if data['status'] == '1' and data['result']:
+                abi = json.loads(data['result'])
+                print(f"✅ 成功获取{contract_name}ABI，包含 {len(abi)} 个函数")
+                return abi
+            else:
+                print(f"⚠️ 无法从Etherscan获取{contract_name}ABI: {data.get('message', 'Unknown error')}")
+                return None
+                
+        except Exception as e:
+            print(f"⚠️ 获取{contract_name}ABI失败: {e}")
+            return None
+    
+    def _get_fallback_abis(self):
+        """获取备用ABI"""
+        # USDT合约备用ABI (标准ERC20)
+        usdt_fallback_abi = [
             {
                 "constant": False,
                 "inputs": [
@@ -193,15 +229,36 @@ class ConcreteStableInteraction:
             }
         ]
         
-        # Concrete_STABLE合约ABI (基本功能，可能需要根据实际合约调整)
-        self.concrete_abi = [
+        # Concrete_STABLE备用ABI - 主要使用ERC4626标准
+        concrete_fallback_abi = [
+            # ERC4626标准的deposit函数 - 这是主要使用的函数
             {
                 "constant": False,
-                "inputs": [{"name": "amount", "type": "uint256"}],
+                "inputs": [
+                    {"name": "assets", "type": "uint256"},
+                    {"name": "receiver", "type": "address"}
+                ],
                 "name": "deposit",
-                "outputs": [],
+                "outputs": [{"name": "shares", "type": "uint256"}],
                 "type": "function"
             },
+            # ERC4626预览函数
+            {
+                "constant": True,
+                "inputs": [{"name": "assets", "type": "uint256"}],
+                "name": "previewDeposit",
+                "outputs": [{"name": "shares", "type": "uint256"}],
+                "type": "function"
+            },
+            # ERC4626底层资产
+            {
+                "constant": True,
+                "inputs": [],
+                "name": "asset",
+                "outputs": [{"name": "", "type": "address"}],
+                "type": "function"
+            },
+            # 基础ERC20函数
             {
                 "constant": True,
                 "inputs": [{"name": "user", "type": "address"}],
@@ -215,27 +272,116 @@ class ConcreteStableInteraction:
                 "name": "totalSupply",
                 "outputs": [{"name": "", "type": "uint256"}],
                 "type": "function"
+            },
+            # 备用的简单deposit函数
+            {
+                "constant": False,
+                "inputs": [{"name": "amount", "type": "uint256"}],
+                "name": "deposit",
+                "outputs": [],
+                "type": "function"
             }
         ]
         
-        # 创建合约实例
+        return usdt_fallback_abi, concrete_fallback_abi
+    
+    def _get_contract_abis(self):
+        """获取所有合约的ABI"""
+        print(f"🔄 开始获取合约ABI...")
+        
+        # 获取备用ABI
+        usdt_fallback, concrete_fallback = self._get_fallback_abis()
+        
+        # 获取USDT ABI
+        self.usdt_abi = self._get_contract_abi(self.USDT_CONTRACT_ADDRESS, "USDT")
+        if not self.usdt_abi:
+            print(f"📋 使用USDT备用ABI")
+            self.usdt_abi = usdt_fallback
+        
+        # 获取Concrete_STABLE ABI
+        self.concrete_abi = self._get_contract_abi(self.CONCRETE_STABLE_ADDRESS, "Concrete_STABLE")
+        if not self.concrete_abi:
+            print(f"📋 使用Concrete_STABLE备用ABI (包含ERC4626标准函数)")
+            self.concrete_abi = concrete_fallback
+        
+        # 分析获取到的ABI
+        self._analyze_contract_functions()
+    
+    def _analyze_contract_functions(self):
+        """分析合约可用函数"""
+        print(f"\n📊 合约函数分析:")
+        
+        # 分析USDT合约
+        usdt_functions = [func['name'] for func in self.usdt_abi if func['type'] == 'function']
+        print(f"   USDT合约函数: {', '.join(usdt_functions)}")
+        
+        # 分析Concrete_STABLE合约
+        concrete_functions = [func['name'] for func in self.concrete_abi if func['type'] == 'function']
+        print(f"   Concrete_STABLE函数: {', '.join(concrete_functions)}")
+        
+        # 查找deposit函数的不同签名
+        deposit_functions = [func for func in self.concrete_abi if func['name'] == 'deposit']
+        print(f"   找到 {len(deposit_functions)} 个deposit函数变体:")
+        
+        for i, func in enumerate(deposit_functions, 1):
+            input_types = [inp['type'] for inp in func['inputs']]
+            input_names = [inp['name'] for inp in func['inputs']]
+            signature = f"deposit({', '.join(f'{t} {n}' for t, n in zip(input_types, input_names))})"
+            print(f"     {i}. {signature}")
+        
+        self.deposit_functions = deposit_functions
+        print()
+    
+    def _init_contracts(self):
+        """使用获取到的ABI初始化合约实例"""
         try:
+            print(f"🔄 初始化合约实例...")
+            
+            # 创建USDT合约实例
             self.usdt_contract = self.web3.eth.contract(
                 address=self.USDT_CONTRACT_ADDRESS,
                 abi=self.usdt_abi
             )
             
+            # 创建Concrete_STABLE合约实例
             self.concrete_contract = self.web3.eth.contract(
                 address=self.CONCRETE_STABLE_ADDRESS,
                 abi=self.concrete_abi
             )
             
-            # 验证USDT合约
-            usdt_symbol = self.usdt_contract.functions.symbol().call()
-            usdt_decimals = self.usdt_contract.functions.decimals().call()
+            # 验证USDT合约连接
+            try:
+                usdt_symbol = self.usdt_contract.functions.symbol().call()
+                usdt_decimals = self.usdt_contract.functions.decimals().call()
+                print(f"✅ USDT合约连接成功: {usdt_symbol} (精度: {usdt_decimals})")
+            except Exception as e:
+                print(f"⚠️ USDT合约验证失败: {e}")
             
-            print(f"✅ 合约连接成功!")
-            print(f"   USDT代币: {usdt_symbol} (精度: {usdt_decimals})")
+            # 验证Concrete_STABLE合约连接
+            try:
+                # 检查合约代码
+                code = self.web3.eth.get_code(self.CONCRETE_STABLE_ADDRESS)
+                if code == '0x':
+                    print(f"⚠️ Concrete_STABLE地址没有合约代码")
+                else:
+                    print(f"✅ Concrete_STABLE合约连接成功 (代码长度: {len(code)} bytes)")
+                    
+                    # 尝试调用asset函数来验证这是ERC4626合约
+                    try:
+                        if any(func['name'] == 'asset' for func in self.concrete_abi):
+                            asset_address = self.concrete_contract.functions.asset().call()
+                            print(f"   底层资产: {asset_address}")
+                            if asset_address.lower() == self.USDT_CONTRACT_ADDRESS.lower():
+                                print(f"   ✅ 确认为USDT的ERC4626合约")
+                            else:
+                                print(f"   ⚠️ 底层资产不是USDT: {asset_address}")
+                    except Exception as asset_error:
+                        print(f"   注意: 无法调用asset函数: {asset_error}")
+                        
+            except Exception as e:
+                print(f"⚠️ Concrete_STABLE合约验证失败: {e}")
+            
+            print(f"✅ 合约初始化完成!")
             print()
             
         except Exception as e:
@@ -338,11 +484,7 @@ class ConcreteStableInteraction:
             raise Exception(f"查询余额失败: {e}")
     
     def approve_usdt(self, amount=None):
-        """授权USDT给Concrete_STABLE合约
-        
-        Args:
-            amount: 授权数量，如果为None则授权最大值
-        """
+        """授权USDT给Concrete_STABLE合约"""
         try:
             print(f"🔄 准备授权USDT...")
             
@@ -391,13 +533,10 @@ class ConcreteStableInteraction:
     def deposit_usdt(self, amount):
         """存款USDT到Concrete_STABLE合约
         使用ERC4626标准的deposit函数: deposit(uint256 assets, address receiver)
-        
-        Args:
-            amount: 存款数量
         """
         try:
             print(f"🔄 准备存款 {amount:,.6f} USDT...")
-            print(f"   使用函数签名: deposit(uint256 assets, address receiver)")
+            print(f"   使用ERC4626标准函数: deposit(uint256 assets, address receiver)")
             
             # 转换为合约单位
             usdt_decimals = self.usdt_contract.functions.decimals().call()
@@ -414,22 +553,8 @@ class ConcreteStableInteraction:
             if balances['allowance'] < amount:
                 raise Exception(f"授权额度不足: {balances['allowance']:.6f} < {amount:.6f}")
             
-            # 查找正确的deposit函数
-            deposit_function = None
-            for func in self.deposit_functions:
-                if len(func['inputs']) == 2:
-                    input_types = [inp['type'] for inp in func['inputs']]
-                    if input_types == ['uint256', 'address']:
-                        deposit_function = func
-                        break
-            
-            if not deposit_function:
-                # 如果没找到，使用默认的ERC4626 deposit函数
-                print(f"   未找到匹配的deposit函数，使用默认ERC4626签名")
-                contract_function = self.concrete_contract.functions.deposit(amount_raw, self.wallet_address)
-            else:
-                print(f"   使用找到的deposit函数")
-                contract_function = self.concrete_contract.functions.deposit(amount_raw, self.wallet_address)
+            # 使用ERC4626的deposit函数：deposit(uint256 assets, address receiver)
+            contract_function = self.concrete_contract.functions.deposit(amount_raw, self.wallet_address)
             
             # 先进行模拟调用来检查是否会成功
             try:
@@ -438,6 +563,13 @@ class ConcreteStableInteraction:
                 print(f"   ✅ 模拟调用成功，预期返回: {simulation_result}")
             except Exception as sim_error:
                 print(f"   ❌ 模拟调用失败: {sim_error}")
+                # 尝试预览deposit来获取更多信息
+                try:
+                    if any(func['name'] == 'previewDeposit' for func in self.concrete_abi):
+                        preview_result = self.concrete_contract.functions.previewDeposit(amount_raw).call()
+                        print(f"   💡 预览存款结果: {preview_result} shares")
+                except:
+                    pass
                 raise Exception(f"存款模拟失败，交易可能会revert: {sim_error}")
             
             # 构建交易
@@ -488,8 +620,8 @@ class ConcreteStableInteraction:
 
 def main():
     """主函数"""
-    print("🏦 Concrete_STABLE 合约交互工具")
-    print("=" * 60)
+    print("🏦 Concrete_STABLE 合约交互工具 v2 (ERC4626标准)")
+    print("=" * 70)
     
     # 检查命令行参数
     if len(sys.argv) < 2:
@@ -499,7 +631,7 @@ def main():
         print("📝 支持的操作:")
         print(f"  balance              - 查询余额")
         print(f"  approve [amount]     - 授权USDT (不指定amount则授权最大值)")
-        print(f"  deposit <amount>     - 存款USDT")
+        print(f"  deposit <amount>     - 存款USDT (使用ERC4626标准)")
         print(f"  all <amount>         - 执行完整流程: 授权最大值 + 存款指定数量")
         print()
         print("🎭 模式选项:")
@@ -507,23 +639,17 @@ def main():
         print(f"  (默认)             - 使用真实签名模式")
         print()
         print("📝 示例:")
-        print(f"  python {sys.argv[0]} balance")
         print(f"  python {sys.argv[0]} balance --mock")
         print(f"  python {sys.argv[0]} approve --mock")
-        print(f"  python {sys.argv[0]} approve 50000")
-        print(f"  python {sys.argv[0]} deposit 20000 --mock")
-        print(f"  python {sys.argv[0]} all 20000 --mock")
+        print(f"  python {sys.argv[0]} deposit 100 --mock")
+        print(f"  python {sys.argv[0]} all 100 --mock")
         print()
         print("🔧 环境变量配置 (.env文件):")
-        print("  # 真实模式")
-        print("  WALLET_PRIVATE_KEY=0x1234...5678")
-        print("  WEB3_RPC_URL=https://eth.llamarpc.com")
-        print("  WEB3_NETWORK_ID=1")
-        print()
         print("  # Mock模式 (本地分叉)")
         print("  MOCK_WALLET_ADDRESS=0xF977814e90dA44bFA03b6295A0616a897441aceC")
         print("  WEB3_RPC_URL=http://127.0.0.1:8545")
         print("  WEB3_NETWORK_ID=31337")
+        print("  ETHERSCAN_API_KEY=YourApiKeyToken")
         return
     
     # 解析参数
@@ -536,7 +662,7 @@ def main():
     
     try:
         # 创建交互器实例
-        interactor = ConcreteStableInteraction(mock_mode=mock_mode)
+        interactor = ConcreteStableInteractionV2(mock_mode=mock_mode)
         
         if operation == "balance":
             # 查询余额
