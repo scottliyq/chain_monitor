@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-地址标签查询工具 - SQLite版本
-查询顺序：本地常量 -> SQLite缓存 -> 外部API -> 更新SQLite
+地址标签查询工具 - SQLite + 多API版本
+查询顺序：本地常量 -> SQLite缓存 -> Moralis API -> Etherscan API -> 更新SQLite
 支持多网络地址查询，Unknown结果不保存
+优先使用Moralis API，失败时回退到Etherscan API
 """
 
 import json
@@ -13,7 +14,10 @@ import sqlite3
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 from datetime import datetime
+from dotenv import load_dotenv
 
+# 加载环境变量
+load_dotenv()
 # 导入本地地址常量
 try:
     from address_constants import get_address_info, is_known_address, ALL_KNOWN_ADDRESSES
@@ -21,6 +25,14 @@ try:
 except ImportError:
     print("⚠️ 未找到 address_constants.py，将使用内置标签")
     HAS_CONSTANTS = False
+
+# 导入Moralis API客户端
+try:
+    from moralis_api_client import MoralisAPIClient
+    HAS_MORALIS_CLIENT = True
+except ImportError:
+    print("⚠️ 未找到 moralis_api_client.py，Moralis功能将被禁用")
+    HAS_MORALIS_CLIENT = False
 
 # 导入requests (如果可用)
 try:
@@ -40,7 +52,13 @@ class SQLiteAddressLabelQuerier:
         # 初始化SQLite数据库
         self.init_database()
         
-        # 初始化请求会话
+        # 初始化Moralis API客户端
+        if HAS_MORALIS_CLIENT:
+            self.moralis_client = MoralisAPIClient()
+        else:
+            self.moralis_client = None
+        
+        # 初始化请求会话 (用于Etherscan API)
         if HAS_REQUESTS:
             self.session = requests.Session()
             self.session.headers.update({
@@ -54,32 +72,13 @@ class SQLiteAddressLabelQuerier:
         self.query_stats = {
             'constants_hits': 0,
             'sqlite_hits': 0,
-            'api_queries': 0,
+            'moralis_queries': 0,
+            'etherscan_queries': 0,
             'sqlite_updates': 0,
             'total_queries': 0
         }
         
-        # 网络配置
-        self.network_configs = {
-            'ethereum': {
-                'name': 'Ethereum Mainnet',
-                'chain_id': 1,
-                'api_base': 'https://api.etherscan.io/api',
-                'native_token': 'ETH'
-            },
-            'polygon': {
-                'name': 'Polygon',
-                'chain_id': 137,
-                'api_base': 'https://api.polygonscan.com/api',
-                'native_token': 'MATIC'
-            },
-            'bsc': {
-                'name': 'Binance Smart Chain',
-                'chain_id': 56,
-                'api_base': 'https://api.bscscan.com/api',
-                'native_token': 'BNB'
-            }
-        }
+        # 加载API密钥
     
     def init_database(self):
         """初始化SQLite数据库"""
@@ -254,18 +253,53 @@ class SQLiteAddressLabelQuerier:
         except Exception as e:
             print(f"❌ SQLite保存失败: {e}")
     
+    def query_moralis_api(self, address: str, network: str = 'ethereum') -> Optional[Dict]:
+        """从Moralis API查询地址信息 - 使用独立的Moralis客户端"""
+        if not self.moralis_client or not self.moralis_client.is_api_available():
+            print(f"⚠️ Moralis API客户端不可用")
+            return None
+        
+        try:
+            result = self.moralis_client.query_address_info(address, network)
+            if result:
+                self.query_stats['moralis_queries'] += 1
+            return result
+            
+        except Exception as e:
+            print(f"⚠️ Moralis API查询异常: {e}")
+            return None
+            
+        except Exception as e:
+            print(f"⚠️ Moralis API查询异常: {e}")
+            return None
+    
     def query_etherscan_api(self, address: str, network: str = 'ethereum') -> Optional[Dict]:
-        """从Etherscan API查询地址信息"""
+        """从Etherscan API查询地址信息 - 备用API"""
         if not HAS_REQUESTS or not self.session:
             return None
         
-        network_config = self.network_configs.get(network.lower())
-        if not network_config:
+        # 网络配置映射
+        network_map = {
+            'ethereum': {'domain': 'api.etherscan.io', 'chain_id': 1},
+            'polygon': {'domain': 'api.polygonscan.com', 'chain_id': 137},
+            'bsc': {'domain': 'api.bscscan.com', 'chain_id': 56},
+            'arbitrum': {'domain': 'api.arbiscan.io', 'chain_id': 42161},
+            'base': {'domain': 'api.basescan.org', 'chain_id': 8453}
+        }
+        
+        config = network_map.get(network.lower())
+        if not config:
             print(f"⚠️ 不支持的网络: {network}")
+            return None
+        
+        # 检查API密钥
+        if not self.etherscan_api_key or self.etherscan_api_key == 'YourApiKeyToken':
+            print(f"⚠️ 未配置Etherscan API密钥")
             return None
         
         try:
             # 查询合约信息
+            url = f"https://{config['domain']}/api"
             params = {
                 'module': 'contract',
                 'action': 'getsourcecode',
@@ -273,11 +307,7 @@ class SQLiteAddressLabelQuerier:
                 'apikey': self.etherscan_api_key
             }
             
-            response = self.session.get(
-                network_config['api_base'], 
-                params=params, 
-                timeout=10
-            )
+            response = self.session.get(url, params=params, timeout=10)
             
             if response.status_code != 200:
                 return None
@@ -285,22 +315,24 @@ class SQLiteAddressLabelQuerier:
             data = response.json()
             
             if data.get('status') == '1' and data.get('result'):
-                result = data['result'][0]
+                result = data['result'][0] if isinstance(data['result'], list) else data['result']
                 contract_name = result.get('ContractName', '').strip()
                 
                 if contract_name and contract_name != '':
-                    self.query_stats['api_queries'] += 1
+                    self.query_stats['etherscan_queries'] += 1
                     
                     return {
                         'label': f"Contract: {contract_name}",
                         'type': 'contract',
-                        'source': f'{network}_api',
+                        'source': f'etherscan_{network}',
                         'contract_name': contract_name,
                         'is_verified': True,
                         'network': network
                     }
+            else:
+                # 记录API错误信息
+                print(f"   📄 Etherscan API消息: {data.get('message', 'Unknown error')}")
             
-            # 可以在这里添加其他API查询逻辑
             return None
             
         except Exception as e:
@@ -328,16 +360,25 @@ class SQLiteAddressLabelQuerier:
         if cache_result:
             return cache_result
         
-        # 3. 查询外部API
-        print(f"   🌐 查询{network} API...")
-        api_result = self.query_etherscan_api(address, network)
-        if api_result:
-            print(f"   🎯 API查询成功: {api_result['label']}")
+        # 3. 查询外部API - 优先使用Moralis API
+        print(f"   🌐 查询Moralis API...")
+        moralis_result = self.query_moralis_api(address, network)
+        if moralis_result:
+            print(f"   🎯 Moralis API查询成功: {moralis_result['label']}")
             # 保存API结果到SQLite
-            self.save_to_sqlite(address, network, api_result)
-            return api_result
+            self.save_to_sqlite(address, network, moralis_result)
+            return moralis_result
         
-        # 4. 默认返回Unknown - 也保存到SQLite
+        # 4. 如果Moralis API失败，回退到Etherscan API
+        print(f"   🔄 回退到Etherscan API...")
+        etherscan_result = self.query_etherscan_api(address, network)
+        if etherscan_result:
+            print(f"   🎯 Etherscan API查询成功: {etherscan_result['label']}")
+            # 保存API结果到SQLite
+            self.save_to_sqlite(address, network, etherscan_result)
+            return etherscan_result
+        
+        # 5. 默认返回Unknown - 也保存到SQLite
         default_result = {
             'label': 'Unknown Address',
             'type': 'unknown',
@@ -516,8 +557,11 @@ class SQLiteAddressLabelQuerier:
             print()
             
             # API查询间隔，避免限制
-            if label_info.get('source', '').endswith('_api'):
-                time.sleep(0.5)
+            source = label_info.get('source', '')
+            if source.startswith('moralis_'):
+                time.sleep(0.3)  # Moralis API限制相对宽松，300ms间隔
+            elif source.startswith('etherscan_'):
+                time.sleep(0.5)  # Etherscan API需要500ms间隔
         
         # 保存结果
         self.save_results(results, file_path)
@@ -566,7 +610,8 @@ class SQLiteAddressLabelQuerier:
                 f.write(f"总地址数: {len(results)}\n")
                 f.write(f"查询统计: 常量({self.query_stats['constants_hits']}) | "
                        f"SQLite({self.query_stats['sqlite_hits']}) | "
-                       f"API({self.query_stats['api_queries']}) | "
+                       f"Moralis({self.query_stats['moralis_queries']}) | "
+                       f"Etherscan({self.query_stats['etherscan_queries']}) | "
                        f"更新({self.query_stats['sqlite_updates']})\n\n")
                 
                 for i, result in enumerate(results, 1):
@@ -593,18 +638,26 @@ class SQLiteAddressLabelQuerier:
         print("=" * 30)
         print(f"📖 常量库命中: {self.query_stats['constants_hits']} 次")
         print(f"📊 SQLite命中: {self.query_stats['sqlite_hits']} 次") 
-        print(f"🌐 API查询: {self.query_stats['api_queries']} 次")
+        print(f"🌐 Moralis API查询: {self.query_stats['moralis_queries']} 次")
+        print(f"🔧 Etherscan API查询: {self.query_stats['etherscan_queries']} 次")
         print(f"💿 SQLite更新: {self.query_stats['sqlite_updates']} 次")
         print(f"🔍 总查询: {self.query_stats['total_queries']} 次")
         
+        total_api_queries = self.query_stats['moralis_queries'] + self.query_stats['etherscan_queries']
         total_successful = (self.query_stats['constants_hits'] + 
                            self.query_stats['sqlite_hits'] + 
-                           self.query_stats['api_queries'])
+                           total_api_queries)
         
         if total_successful > 0:
             cache_hit_rate = ((self.query_stats['constants_hits'] + self.query_stats['sqlite_hits']) 
                              / total_successful * 100)
             print(f"🎯 缓存命中率: {cache_hit_rate:.1f}%")
+        
+        if total_api_queries > 0:
+            moralis_rate = (self.query_stats['moralis_queries'] / total_api_queries * 100)
+            etherscan_rate = (self.query_stats['etherscan_queries'] / total_api_queries * 100)
+            print(f"🌐 Moralis API使用率: {moralis_rate:.1f}%")
+            print(f"🔧 Etherscan API使用率: {etherscan_rate:.1f}%")
         
         # SQLite统计信息
         cursor = self.conn.execute('SELECT COUNT(*) FROM address_labels')
@@ -691,7 +744,7 @@ def main():
     """主函数"""
     import sys
     
-    print("🏷️ 地址标签查询工具 (SQLite版本)")
+    print("🏷️ 地址标签查询工具 (SQLite版本 + DeFi协议识别)")
     print("=" * 50)
     
     if len(sys.argv) > 1:
