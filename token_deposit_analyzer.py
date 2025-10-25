@@ -592,7 +592,7 @@ class TokenDepositAnalyzer:
             
             # 获取交易详情来分析方法
             tx_details = self.get_transaction_details(transfer['hash'])
-            method_name = "transfer"  # USDT转账默认是transfer方法
+            method_name = "transfer"  # 代币转账默认是transfer方法
             
             if tx_details:
                 transfer['tx_details'] = tx_details
@@ -604,11 +604,11 @@ class TokenDepositAnalyzer:
                 contract_name = known_defi_contracts[to_address]
                 contract_counter[contract_name] += 1
                 
-                # 如果是转入DeFi协议的USDT，认为是deposit操作
+                # 如果是转入DeFi协议的代币，认为是deposit操作
                 transfer['contract_name'] = contract_name
                 transfer['is_defi_deposit'] = True
                 deposit_transfers.append(transfer)
-                logger.info(f"   🏦 发现DeFi deposit: {transfer['amount_usdt']:,.0f} USDT → {contract_name}")
+                logger.info(f"   🏦 发现DeFi deposit: {transfer['amount_usdt']:,.0f} {self.token} → {contract_name}")
             else:
                 # 检查是否是合约地址
                 try:
@@ -622,7 +622,7 @@ class TokenDepositAnalyzer:
                                 transfer['is_defi_deposit'] = True
                                 deposit_transfers.append(transfer)
                                 contract_counter[contract_name] += 1
-                                logger.info(f"   🏦 发现潜在DeFi deposit: {transfer['amount_usdt']:,.0f} USDT → {contract_name}")
+                                logger.info(f"   🏦 发现潜在DeFi deposit: {transfer['amount_usdt']:,.0f} {self.token} → {contract_name}")
                 except:
                     pass
             
@@ -759,13 +759,15 @@ class TokenDepositAnalyzer:
     
     def format_results(self, deposit_transfers, top_5_contracts, contract_info, stats):
         """格式化并显示结果"""
-        logger.info(f"📊 USDT大额Deposit交易分析结果")
+        logger.info(f"📊 {self.token} {self.network.title()} 大额Deposit交易分析结果")
         logger.info(f"{'='*80}")
         logger.info(f"⏰ 分析时间范围: 过去24小时")
-        logger.info(f"💰 最小金额: {self.min_amount:,} USDT")
+        logger.info(f"🌐 网络: {self.network_config['name']}")
+        logger.info(f"🪙 代币: {self.token}")
+        logger.info(f"💰 最小金额: {self.min_amount:,} {self.token}")
         logger.info(f"🏦 Deposit交易总数: {stats['total_transactions']:,} 笔")
-        logger.info(f"💵 总金额: {stats['total_amount']:,.2f} USDT")
-        logger.info(f"📈 平均金额: {stats['average_amount']:,.2f} USDT")
+        logger.info(f"💵 总金额: {stats['total_amount']:,.2f} {self.token}")
+        logger.info(f"📈 平均金额: {stats['average_amount']:,.2f} {self.token}")
         logger.info(f"{'='*80}")
         
         logger.info(f"🏆 转入地址最多的合约前5名:")
@@ -785,13 +787,13 @@ class TokenDepositAnalyzer:
             logger.info(f"#{i}. {contract_name}")
             logger.info(f"     🏠 地址: {contract_address}")
             logger.info(f"     📊 转入次数: {count} 次")
-            logger.info(f"     💰 总金额: {total_amount:,.2f} USDT")
+            logger.info(f"     💰 总金额: {total_amount:,.2f} {self.token}")
             logger.info(f"     📏 代码大小: {code_size:,} bytes")
             logger.info("")
         
         logger.info(f"📈 金额分布:")
         for range_name, count in stats['amount_ranges'].items():
-            logger.info(f"   {range_name} USDT: {count} 笔")
+            logger.info(f"   {range_name} {self.token}: {count} 笔")
         
         logger.info(f"⏰ 24小时分布 (显示活跃时段):")
         sorted_hours = sorted(stats['hour_distribution'].items(), key=lambda x: x[1], reverse=True)
@@ -803,7 +805,7 @@ class TokenDepositAnalyzer:
         try:
             os.makedirs(output_dir, exist_ok=True)
             
-            # 生成文件名
+            # 生成文件名 - 包含网络和代币名称
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             
             # 保存详细数据
@@ -811,6 +813,8 @@ class TokenDepositAnalyzer:
                 'analysis_time': datetime.now().isoformat(),
                 'query_period': '24 hours',
                 'min_amount': self.min_amount,
+                'network': self.network,
+                'token': self.token,
                 'statistics': stats,
                 'top_5_contracts': [
                     {
@@ -843,26 +847,28 @@ class TokenDepositAnalyzer:
                 ]
             }
             
-            # 保存JSON文件
-            json_filename = f"usdt_deposit_analysis_{timestamp}.json"
+            # 保存JSON文件 - 文件名包含网络和代币名称
+            json_filename = f"{self.network}_{self.token.lower()}_deposit_analysis_{timestamp}.json"
             json_filepath = os.path.join(output_dir, json_filename)
             
             with open(json_filepath, 'w', encoding='utf-8') as f:
                 json.dump(result, f, indent=2, ensure_ascii=False, default=str)
             
-            # 保存简化报告
-            txt_filename = f"usdt_deposit_analysis_{timestamp}.txt"
+            # 保存简化报告 - 文件名包含网络和代币名称
+            txt_filename = f"{self.network}_{self.token.lower()}_deposit_analysis_{timestamp}.txt"
             txt_filepath = os.path.join(output_dir, txt_filename)
             
             with open(txt_filepath, 'w', encoding='utf-8') as f:
-                f.write(f"USDT大额Deposit交易分析报告\n")
+                f.write(f"{self.token} {self.network.title()} 大额Deposit交易分析报告\n")
                 f.write(f"{'='*50}\n")
                 f.write(f"分析时间: {datetime.now()}\n")
+                f.write(f"网络: {self.network_config['name']}\n")
+                f.write(f"代币: {self.token}\n")
                 f.write(f"查询范围: 过去24小时\n")
-                f.write(f"最小金额: {self.min_amount:,} USDT\n")
+                f.write(f"最小金额: {self.min_amount:,} {self.token}\n")
                 f.write(f"Deposit交易数: {stats['total_transactions']} 笔\n")
-                f.write(f"总金额: {stats['total_amount']:,.2f} USDT\n")
-                f.write(f"平均金额: {stats['average_amount']:,.2f} USDT\n\n")
+                f.write(f"总金额: {stats['total_amount']:,.2f} {self.token}\n")
+                f.write(f"平均金额: {stats['average_amount']:,.2f} {self.token}\n\n")
                 
                 f.write(f"转入地址最多的合约前5名:\n")
                 f.write(f"{'-'*50}\n")
@@ -875,7 +881,7 @@ class TokenDepositAnalyzer:
                     f.write(f"{i}. {info.get('name', 'Unknown')}\n")
                     f.write(f"   地址: {addr}\n")
                     f.write(f"   转入次数: {count} 次\n")
-                    f.write(f"   总金额: {total_amount:,.2f} USDT\n\n")
+                    f.write(f"   总金额: {total_amount:,.2f} {self.token}\n\n")
             
             logger.info(f"💾 结果已保存:")
             logger.info(f"   📄 详细数据: {json_filepath}")
@@ -945,6 +951,21 @@ class TokenDepositAnalyzer:
             
             if not all_transfers:
                 logger.error("❌ 未找到任何转账记录")
+                # 即使没有数据也要生成结果文件
+                query_date = datetime.fromtimestamp(self.start_time, tz=timezone.utc).strftime('%Y-%m-%d')
+                empty_stats = {
+                    'total_amount': 0,
+                    'total_transactions': 0,
+                    'contract_count': 0,
+                    'filtered_contract_count': 0,
+                    'average_amount': 0,
+                    'query_date': query_date,
+                    'min_amount': self.min_amount,
+                    'min_interactions': 10
+                }
+                self.format_filtered_results([], [], empty_stats)
+                self.save_filtered_results([], [], empty_stats)
+                logger.info(f"\n✅ 分析完成! (无数据)")
                 return
             
             logger.info(f"📦 获取到总计 {len(all_transfers)} 笔{self.token}转账")
@@ -954,6 +975,21 @@ class TokenDepositAnalyzer:
             
             if not processed_transfers:
                 logger.error(f"❌ 未发现大于{self.min_amount} {self.token}的转账数据")
+                # 即使没有符合条件的转账也要生成结果文件
+                query_date = datetime.fromtimestamp(self.start_time, tz=timezone.utc).strftime('%Y-%m-%d')
+                empty_stats = {
+                    'total_amount': 0,
+                    'total_transactions': 0,
+                    'contract_count': 0,
+                    'filtered_contract_count': 0,
+                    'average_amount': 0,
+                    'query_date': query_date,
+                    'min_amount': self.min_amount,
+                    'min_interactions': 10
+                }
+                self.format_filtered_results([], [], empty_stats)
+                self.save_filtered_results([], [], empty_stats)
+                logger.info(f"\n✅ 分析完成! (无符合条件的交易)")
                 return
             
             # 分析所有转账，统计合约交互
@@ -961,6 +997,21 @@ class TokenDepositAnalyzer:
             
             if not contract_destinations:
                 logger.error(f"❌ 未发现转入合约地址的转账")
+                # 即使没有合约地址转账也要生成结果文件
+                query_date = datetime.fromtimestamp(self.start_time, tz=timezone.utc).strftime('%Y-%m-%d')
+                stats = {
+                    'total_amount': sum(transfer['amount_usdt'] for transfer in processed_transfers),
+                    'total_transactions': len(processed_transfers),
+                    'contract_count': 0,
+                    'filtered_contract_count': 0,
+                    'average_amount': sum(transfer['amount_usdt'] for transfer in processed_transfers) / len(processed_transfers) if processed_transfers else 0,
+                    'query_date': query_date,
+                    'min_amount': self.min_amount,
+                    'min_interactions': 10
+                }
+                self.format_filtered_results(processed_transfers, [], stats)
+                self.save_filtered_results(processed_transfers, [], stats)
+                logger.info(f"\n✅ 分析完成! (无合约地址转账)")
                 return
             
             # 筛选交互数量大于10的合约，按交互数量排序
@@ -978,13 +1029,16 @@ class TokenDepositAnalyzer:
             logger.info(f"🎯 交互数量大于10的合约: {len(sorted_contracts)} 个")
             
             # 计算统计信息
+            # 从开始时间提取日期作为查询日期
+            query_date = datetime.fromtimestamp(self.start_time, tz=timezone.utc).strftime('%Y-%m-%d')
+            
             stats = {
                 'total_amount': sum(info['total_amount'] for info in contract_destinations.values()),
                 'total_transactions': len(processed_transfers),
                 'contract_count': len(contract_destinations),
                 'filtered_contract_count': len(sorted_contracts),
                 'average_amount': sum(transfer['amount_usdt'] for transfer in processed_transfers) / len(processed_transfers) if processed_transfers else 0,
-                'query_date': '2024-10-24',
+                'query_date': query_date,
                 'min_amount': self.min_amount,
                 'min_interactions': 10
             }
@@ -1002,14 +1056,16 @@ class TokenDepositAnalyzer:
     
     def format_filtered_results(self, all_transfers, sorted_contracts, stats):
         """格式化并显示筛选后的交易分析结果"""
-        logger.info(f"📊 {self.token}交易分析结果")
+        logger.info(f"📊 {self.token} {self.network.title()} 交易分析结果")
         logger.info("=" * 80)
         logger.info(f"⏰ 分析时间范围: {stats['query_date']} UTC 全天")
-        logger.info(f"💰 最小金额: {stats['min_amount']:,} USDT")
-        logger.info(f"� 最小交互次数: {stats['min_interactions']} 次")
-        logger.info(f"�🏦 总交易数: {stats['total_transactions']:,} 笔")
-        logger.info(f"💵 总金额: {stats['total_amount']:,.2f} USDT")
-        logger.info(f"📈 平均金额: {stats['average_amount']:,.2f} USDT")
+        logger.info(f"🌐 网络: {self.network_config['name']}")
+        logger.info(f"🪙 代币: {self.token}")
+        logger.info(f"💰 最小金额: {stats['min_amount']:,} {self.token}")
+        logger.info(f"🔢 最小交互次数: {stats['min_interactions']} 次")
+        logger.info(f"🏦 总交易数: {stats['total_transactions']:,} 笔")
+        logger.info(f"💵 总金额: {stats['total_amount']:,.2f} {self.token}")
+        logger.info(f"📈 平均金额: {stats['average_amount']:,.2f} {self.token}")
         logger.info(f"🏗️ 总合约数: {stats['contract_count']} 个")
         logger.info(f"🎯 符合条件的合约数: {stats['filtered_contract_count']} 个")
         logger.info("=" * 80)
@@ -1020,32 +1076,32 @@ class TokenDepositAnalyzer:
             logger.info(f"#{i}. {info['name']}")
             logger.info(f"     🏠 地址: {address}")
             logger.info(f"     📊 交互次数: {info['transaction_count']} 次")
-            logger.info(f"     💰 总金额: {info['total_amount']:,.2f} USDT")
-            logger.info(f"     📏 平均金额: {info['total_amount']/info['transaction_count']:,.2f} USDT")
+            logger.info(f"     💰 总金额: {info['total_amount']:,.2f} {self.token}")
+            logger.info(f"     📏 平均金额: {info['total_amount']/info['transaction_count']:,.2f} {self.token}")
             logger.info(f"     📏 合约状态: {'✅ 已验证合约' if info['is_contract'] else '❌ 非合约地址'}")
             logger.info("")
         
         # 显示金额分布
         amount_ranges = {
-            "1K-10K USDT": 0,
-            "10K-100K USDT": 0,
-            "100K-1M USDT": 0,
-            "1M-10M USDT": 0,
-            "> 10M USDT": 0
+            f"1K-10K {self.token}": 0,
+            f"10K-100K {self.token}": 0,
+            f"100K-1M {self.token}": 0,
+            f"1M-10M {self.token}": 0,
+            f"> 10M {self.token}": 0
         }
         
         for transfer in all_transfers:
             amount = transfer['amount_usdt']
             if amount >= 10000000:
-                amount_ranges["> 10M USDT"] += 1
+                amount_ranges[f"> 10M {self.token}"] += 1
             elif amount >= 1000000:
-                amount_ranges["1M-10M USDT"] += 1
+                amount_ranges[f"1M-10M {self.token}"] += 1
             elif amount >= 100000:
-                amount_ranges["100K-1M USDT"] += 1
+                amount_ranges[f"100K-1M {self.token}"] += 1
             elif amount >= 10000:
-                amount_ranges["10K-100K USDT"] += 1
+                amount_ranges[f"10K-100K {self.token}"] += 1
             elif amount >= 1000:
-                amount_ranges["1K-10K USDT"] += 1
+                amount_ranges[f"1K-10K {self.token}"] += 1
         
         logger.info(f"📈 金额分布:")
         for range_name, count in amount_ranges.items():
@@ -1070,7 +1126,7 @@ class TokenDepositAnalyzer:
         try:
             os.makedirs(output_dir, exist_ok=True)
             
-            # 生成文件名
+            # 生成文件名 - 包含网络和代币名称
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             
             # 保存详细数据
@@ -1078,6 +1134,8 @@ class TokenDepositAnalyzer:
                 'analysis_time': datetime.now().isoformat(),
                 'query_date': stats['query_date'],
                 'query_period': f"{stats['query_date']} UTC全天",
+                'network': self.network,
+                'token': self.token,
                 'min_amount': stats['min_amount'],
                 'min_interactions': stats['min_interactions'],
                 'statistics': stats,
@@ -1108,27 +1166,29 @@ class TokenDepositAnalyzer:
                 ]
             }
             
-            # 保存JSON文件
-            json_filename = f"usdt_analysis_{stats['query_date'].replace('-', '')}_{timestamp}.json"
+            # 保存JSON文件 - 文件名包含网络和代币名称
+            json_filename = f"{self.network}_{self.token.lower()}_analysis_{stats['query_date'].replace('-', '')}_{timestamp}.json"
             json_filepath = os.path.join(output_dir, json_filename)
             
             with open(json_filepath, 'w', encoding='utf-8') as f:
                 json.dump(result, f, indent=2, ensure_ascii=False, default=str)
             
-            # 保存简化报告
-            txt_filename = f"usdt_analysis_{stats['query_date'].replace('-', '')}_{timestamp}.txt"
+            # 保存简化报告 - 文件名包含网络和代币名称
+            txt_filename = f"{self.network}_{self.token.lower()}_analysis_{stats['query_date'].replace('-', '')}_{timestamp}.txt"
             txt_filepath = os.path.join(output_dir, txt_filename)
             
             with open(txt_filepath, 'w', encoding='utf-8') as f:
-                f.write(f"USDT交易分析报告\n")
+                f.write(f"{self.token} {self.network.title()} 交易分析报告\n")
                 f.write(f"{'='*50}\n")
                 f.write(f"分析时间: {datetime.now()}\n")
+                f.write(f"网络: {self.network_config['name']}\n")
+                f.write(f"代币: {self.token}\n")
                 f.write(f"查询日期: {stats['query_date']} UTC全天\n")
-                f.write(f"最小金额: {stats['min_amount']:,} USDT\n")
+                f.write(f"最小金额: {stats['min_amount']:,} {self.token}\n")
                 f.write(f"最小交互次数: {stats['min_interactions']} 次\n")
                 f.write(f"总交易数: {stats['total_transactions']:,} 笔\n")
-                f.write(f"总金额: {stats['total_amount']:,.2f} USDT\n")
-                f.write(f"平均金额: {stats['average_amount']:,.2f} USDT\n")
+                f.write(f"总金额: {stats['total_amount']:,.2f} {self.token}\n")
+                f.write(f"平均金额: {stats['average_amount']:,.2f} {self.token}\n")
                 f.write(f"总合约数: {stats['contract_count']} 个\n")
                 f.write(f"符合条件的合约数: {stats['filtered_contract_count']} 个\n\n")
                 
@@ -1138,8 +1198,8 @@ class TokenDepositAnalyzer:
                     f.write(f"{i}. {info['name']}\n")
                     f.write(f"   地址: {addr}\n")
                     f.write(f"   交互次数: {info['transaction_count']} 次\n")
-                    f.write(f"   总金额: {info['total_amount']:,.2f} USDT\n")
-                    f.write(f"   平均金额: {info['total_amount']/info['transaction_count']:,.2f} USDT\n\n")
+                    f.write(f"   总金额: {info['total_amount']:,.2f} {self.token}\n")
+                    f.write(f"   平均金额: {info['total_amount']/info['transaction_count']:,.2f} {self.token}\n\n")
             
             logger.info(f"\n💾 结果已保存:")
             logger.info(f"   📄 详细数据: {json_filepath}")

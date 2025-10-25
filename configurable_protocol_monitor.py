@@ -14,7 +14,7 @@ import schedule
 from datetime import datetime, timedelta, timezone
 from logging.handlers import TimedRotatingFileHandler
 from collections import Counter
-from usdt_deposit_analyzer import TokenDepositAnalyzer
+from token_deposit_analyzer import TokenDepositAnalyzer
 from address_constant import get_contract_name, get_all_known_contracts, TOKEN_CONTRACTS, get_token_address, get_defi_protocol_name, get_all_defi_protocols, is_defi_protocol
 
 # 配置日志
