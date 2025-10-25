@@ -15,6 +15,7 @@ from web3 import Web3
 from decimal import Decimal
 from collections import defaultdict, Counter
 from dotenv import load_dotenv
+from block_time_converter import BlockTimeConverter
 
 # 加载环境变量
 load_dotenv()
@@ -28,6 +29,9 @@ class USDTDepositAnalyzer:
             end_time (str): 结束时间，格式如 "2025-10-24 23:59:59"
             min_amount (float): 最小转账金额（USDT），默认1000
         """
+        # 初始化区块时间转换器
+        self.block_converter = BlockTimeConverter()
+        
         # 合约地址
         self.USDT_CONTRACT_ADDRESS = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
         
@@ -55,12 +59,20 @@ class USDTDepositAnalyzer:
             print(f"   结束时间: {self.end_time_str} UTC")
         
         print(f"\n🔄 开始转换UTC时间为时间戳...")
-        # 转换UTC时间为时间戳
-        self.start_time = self._datetime_to_timestamp(self.start_time_str)
-        self.current_time = self._datetime_to_timestamp(self.end_time_str)
+        # 使用BlockTimeConverter转换UTC时间为时间戳
+        self.start_time = self.block_converter.datetime_to_timestamp(self.start_time_str)
+        self.current_time = self.block_converter.datetime_to_timestamp(self.end_time_str)
         
-        # 获取对应的区块号范围
-        self.start_block, self.end_block = self._get_block_range()
+        # 使用BlockTimeConverter获取对应的区块号范围
+        print(f"🚀 开始查询时间对应的区块号范围...")
+        try:
+            self.start_block, self.end_block, _ = self.block_converter.get_block_range(self.start_time_str, self.end_time_str)
+            print(f"📦 查询到区块范围: {self.start_block:,} 到 {self.end_block:,} ({self.end_block - self.start_block + 1:,} 个区块)")
+        except Exception as e:
+            print(f"⚠️ 获取区块范围失败: {e}")
+            print(f"   使用默认区块范围（2024年10月24日）")
+            # 返回2024年10月24日的已知区块范围
+            self.start_block, self.end_block = 21031733, 21038905
         
         # 分析配置
         if min_amount is not None:
@@ -95,128 +107,6 @@ class USDTDepositAnalyzer:
                 return "https://eth.llamarpc.com"
         
         return rpc_url.strip()
-    
-    def _datetime_to_timestamp(self, dt_str):
-        """将UTC时间字符串转换为时间戳
-        
-        Args:
-            dt_str (str): UTC时间字符串
-            
-        Returns:
-            int: Unix时间戳
-        """
-        try:
-            print(f"   🕐 解析UTC时间: {dt_str}")
-            
-            # 支持多种时间格式
-            formats = [
-                "%Y-%m-%d %H:%M:%S",
-                "%Y-%m-%dT%H:%M:%S",
-                "%Y-%m-%d",
-                "%Y/%m/%d %H:%M:%S",
-                "%Y/%m/%d"
-            ]
-            
-            dt = None
-            used_format = None
-            for fmt in formats:
-                try:
-                    dt = datetime.strptime(dt_str, fmt)
-                    used_format = fmt
-                    break
-                except ValueError:
-                    continue
-            
-            if dt is None:
-                raise ValueError(f"无法解析时间格式: {dt_str}")
-            
-            # 明确设置时区为UTC
-            dt = dt.replace(tzinfo=timezone.utc)
-            
-            # 转换为时间戳 - 使用UTC时间计算
-            timestamp = int((dt - datetime(1970, 1, 1, tzinfo=timezone.utc)).total_seconds())
-            
-            print(f"   ✅ 解析成功: {dt_str} (格式: {used_format}) -> UTC时间戳: {timestamp}")
-            print(f"   📅 对应UTC时间: {dt}")
-            
-            return timestamp
-            
-        except Exception as e:
-            raise ValueError(f"UTC时间转换失败 {dt_str}: {e}")
-    
-    def _get_block_by_timestamp(self, timestamp, closest='before'):
-        """根据时间戳获取最接近的区块号"""
-        try:
-            # 正确显示UTC时间
-            utc_time = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-            print(f"🔍 查询时间戳 {timestamp} ({utc_time.strftime('%Y-%m-%d %H:%M:%S')} UTC) 对应的区块号...")
-            
-            params = {
-                'chainid': 1,  # 以太坊主网
-                'module': 'block',
-                'action': 'getblocknobytime',
-                'timestamp': timestamp,
-                'closest': closest,
-                'apikey': self.etherscan_api_key
-            }
-            
-            response = requests.get(self.etherscan_api_url, params=params, timeout=30)
-            data = response.json()
-            
-            if data['status'] == '1':
-                block_number = int(data['result'])
-                print(f"   📦 找到区块号: {block_number:,}")
-                return block_number
-            else:
-                print(f"   ❌ API错误: {data.get('message', 'Unknown error')}")
-                return None
-                
-        except Exception as e:
-            print(f"   ❌ 查询区块号失败: {e}")
-            return None
-    
-    def _get_block_range(self):
-        """根据时间范围获取区块号范围"""
-        try:
-            print(f"🚀 开始查询时间对应的区块号范围...")
-            
-            # 检查时间是否为未来时间
-            current_timestamp = int(time.time())
-            if self.start_time > current_timestamp:
-                raise Exception(f"开始时间是未来时间，无法查询区块链数据")
-            if self.current_time > current_timestamp:
-                print(f"⚠️ 警告：结束时间是未来时间，将调整为当前时间")
-                self.current_time = current_timestamp
-                self.end_time_str = datetime.fromtimestamp(current_timestamp, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-            
-            # 获取开始区块（之前最接近的区块）
-            start_block = self._get_block_by_timestamp(self.start_time, 'before')
-            if start_block is None:
-                raise Exception("无法获取开始区块号")
-            
-            time.sleep(0.2)  # API限制
-            
-            # 获取结束区块（之后最接近的区块）
-            end_block = self._get_block_by_timestamp(self.current_time, 'after')
-            if end_block is None:
-                raise Exception("无法获取结束区块号")
-            
-            # 验证区块范围的合理性
-            if start_block >= end_block:
-                print(f"⚠️ 警告：开始区块 {start_block} >= 结束区块 {end_block}")
-                # 调整结束区块
-                end_block = start_block + 7200  # 大约1天的区块数
-                print(f"   自动调整结束区块为: {end_block}")
-            
-            print(f"📦 查询到区块范围: {start_block:,} 到 {end_block:,} ({end_block - start_block + 1:,} 个区块)")
-            
-            return start_block, end_block
-            
-        except Exception as e:
-            print(f"⚠️ 获取区块范围失败: {e}")
-            print(f"   使用默认区块范围（2024年10月24日）")
-            # 返回2024年10月24日的已知区块范围
-            return 21031733, 21038905
     
     def _init_web3(self):
         """初始化Web3连接"""
@@ -281,9 +171,9 @@ class USDTDepositAnalyzer:
             print(f"\n📍 第{segment_count}段: {start_dt.strftime('%H:%M:%S')} - {end_dt.strftime('%H:%M:%S')} UTC")
             
             try:
-                # 获取当前时间段的区块范围
-                start_block = self._get_block_by_timestamp(current_start, 'before')
-                end_block = self._get_block_by_timestamp(current_end, 'after')
+                # 使用BlockTimeConverter获取当前时间段的区块范围
+                start_block = self.block_converter.get_block_by_timestamp(current_start, 'before')
+                end_block = self.block_converter.get_block_by_timestamp(current_end, 'after')
                 
                 if start_block is None or end_block is None:
                     print(f"   ⚠️ 无法获取区块范围，跳过此时间段")
