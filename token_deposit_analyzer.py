@@ -49,7 +49,7 @@ def setup_logging():
     
     # 文件处理器 - 每日轮转，保留7天
     file_handler = TimedRotatingFileHandler(
-        filename=os.path.join(log_dir, 'usdt_analyzer.log'),
+        filename=os.path.join(log_dir, 'token_analyzer.log'),
         when='midnight',      # 每天午夜轮转
         interval=1,           # 每1天轮转一次
         backupCount=7,        # 保留7天的日志文件
