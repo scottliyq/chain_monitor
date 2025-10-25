@@ -5,6 +5,10 @@
 """
 
 import os
+import sys
+# 添加上级目录到路径以便导入模块
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from balance_surge_monitor import USDTBalanceSurgeMonitor
 
 def demo_balance_surge_monitoring():
