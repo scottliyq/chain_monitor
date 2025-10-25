@@ -10,14 +10,62 @@ import sys
 import os
 import json
 import time
+import logging
 import requests
 from datetime import datetime, timedelta, timezone
+from logging.handlers import TimedRotatingFileHandler
 from web3 import Web3
 from decimal import Decimal
 from collections import defaultdict, Counter
 from dotenv import load_dotenv
 from block_time_converter import BlockTimeConverter
-from address_constant import KNOWN_CONTRACTS, USDT_CONTRACT_ADDRESS, TOKEN_CONTRACTS, get_token_address, get_contract_name, get_token_decimals
+from address_constant import KNOWN_CONTRACTS, USDT_CONTRACT_ADDRESS, TOKEN_CONTRACTS, get_token_address, get_contract_name, get_token_decimals, get_defi_protocol_name, get_all_defi_protocols, is_defi_protocol
+
+# 配置日志
+def setup_logging():
+    """设置日志配置，支持控制台输出和每日轮转的文件输出"""
+    # 创建logs目录
+    log_dir = 'logs'
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # 创建logger
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    
+    # 清除可能已存在的处理器
+    if logger.handlers:
+        logger.handlers.clear()
+    
+    # 创建格式器
+    formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # 控制台处理器
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    
+    # 文件处理器 - 每日轮转，保留7天
+    file_handler = TimedRotatingFileHandler(
+        filename=os.path.join(log_dir, 'usdt_analyzer.log'),
+        when='midnight',      # 每天午夜轮转
+        interval=1,           # 每1天轮转一次
+        backupCount=7,        # 保留7天的日志文件
+        encoding='utf-8'
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    
+    # 添加处理器到logger
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+    
+    return logger
+
+# 初始化日志
+logger = setup_logging()
 
 # 加载环境变量
 load_dotenv()
@@ -58,55 +106,55 @@ class TokenDepositAnalyzer:
         if start_time and end_time:
             self.start_time_str = start_time
             self.end_time_str = end_time
-            print(f"📅 使用参数指定的UTC时间范围:")
-            print(f"   开始时间: {start_time} UTC")
-            print(f"   结束时间: {end_time} UTC")
+            logger.info(f"📅 使用参数指定的UTC时间范围:")
+            logger.info(f"   开始时间: {start_time} UTC")
+            logger.info(f"   结束时间: {end_time} UTC")
         else:
             # 默认使用2025年10月24日UTC时间
             self.start_time_str = "2025-10-24 00:00:00"
             self.end_time_str = "2025-10-24 23:59:59"
-            print(f"📅 使用默认UTC时间范围:")
-            print(f"   开始时间: {self.start_time_str} UTC")
-            print(f"   结束时间: {self.end_time_str} UTC")
+            logger.info(f"📅 使用默认UTC时间范围:")
+            logger.info(f"   开始时间: {self.start_time_str} UTC")
+            logger.info(f"   结束时间: {self.end_time_str} UTC")
         
-        print(f"\n🔄 开始转换UTC时间为时间戳...")
+        logger.info(f"🔄 开始转换UTC时间为时间戳...")
         # 使用BlockTimeConverter转换UTC时间为时间戳
         self.start_time = self.block_converter.datetime_to_timestamp(self.start_time_str)
         self.current_time = self.block_converter.datetime_to_timestamp(self.end_time_str)
         
         # 使用BlockTimeConverter获取对应的区块号范围
-        print(f"🚀 开始查询时间对应的区块号范围...")
+        logger.info(f"🚀 开始查询时间对应的区块号范围...")
         try:
             self.start_block, self.end_block, _ = self.block_converter.get_block_range(self.start_time_str, self.end_time_str)
-            print(f"📦 查询到区块范围: {self.start_block:,} 到 {self.end_block:,} ({self.end_block - self.start_block + 1:,} 个区块)")
+            logger.info(f"📦 查询到区块范围: {self.start_block:,} 到 {self.end_block:,} ({self.end_block - self.start_block + 1:,} 个区块)")
         except Exception as e:
-            print(f"⚠️ 获取区块范围失败: {e}")
-            print(f"   使用默认区块范围（2024年10月24日）")
+            logger.error(f"⚠️ 获取区块范围失败: {e}")
+            logger.info(f"   使用默认区块范围（2024年10月24日）")
             # 返回2024年10月24日的已知区块范围
             self.start_block, self.end_block = 21031733, 21038905
         
         # 分析配置
         if min_amount is not None:
             self.min_amount = float(min_amount)
-            print(f"💰 使用参数指定的最小金额: {self.min_amount} {self.token}")
+            logger.info(f"💰 使用参数指定的最小金额: {self.min_amount} {self.token}")
         else:
             self.min_amount = 1000  # 默认1000
-            print(f"💰 使用默认最小金额: {self.min_amount} {self.token}")
+            logger.info(f"💰 使用默认最小金额: {self.min_amount} {self.token}")
         
         # 获取代币小数位数
         self.token_decimals = get_token_decimals(self.network, self.token)
         
-        print(f"🔧 配置信息:")
-        print(f"   网络: {self.network_config['name']} (Chain ID: {self.network_config['chain_id']})")
-        print(f"   {self.token}合约: {self.TOKEN_CONTRACT_ADDRESS}")
-        print(f"   {self.token}小数位数: {self.token_decimals}")
-        print(f"   API端点: {self.api_config['base_url']}")
-        print(f"   API密钥: {'***' + self.api_config['api_key'][-4:] if len(self.api_config['api_key']) > 4 else 'YourApiKeyToken'}")
-        print(f"   RPC URL: {self.rpc_url}")
-        print(f"   查询时间范围: {self.start_time_str} 到 {self.end_time_str} UTC")
-        print(f"   查询区块范围: {self.start_block:,} 到 {self.end_block:,}")
-        print(f"   分析范围: 转账金额 >= {self.min_amount} {self.token}")
-        print()
+        logger.info(f"🔧 配置信息:")
+        logger.info(f"   网络: {self.network_config['name']} (Chain ID: {self.network_config['chain_id']})")
+        logger.info(f"   {self.token}合约: {self.TOKEN_CONTRACT_ADDRESS}")
+        logger.info(f"   {self.token}小数位数: {self.token_decimals}")
+        logger.info(f"   API端点: {self.api_config['base_url']}")
+        logger.info(f"   API密钥: {'***' + self.api_config['api_key'][-4:] if len(self.api_config['api_key']) > 4 else 'YourApiKeyToken'}")
+        logger.info(f"   RPC URL: {self.rpc_url}")
+        logger.info(f"   查询时间范围: {self.start_time_str} 到 {self.end_time_str} UTC")
+        logger.info(f"   查询区块范围: {self.start_block:,} 到 {self.end_block:,}")
+        logger.info(f"   分析范围: 转账金额 >= {self.min_amount} {self.token}")
+        logger.info("")
     
     def _get_network_config(self, network):
         """获取网络配置信息"""
@@ -206,7 +254,7 @@ class TokenDepositAnalyzer:
             }
             
             rpc_url = default_rpcs.get(self.network, "https://eth.llamarpc.com")
-            print(f"⚠️ 使用默认RPC端点: {rpc_url}")
+            logger.info(f"⚠️ 使用默认RPC端点: {rpc_url}")
         
         return rpc_url.strip()
     
@@ -224,14 +272,14 @@ class TokenDepositAnalyzer:
             expected_chain_id = self.network_config["chain_id"]
             
             if chain_id != expected_chain_id:
-                print(f"⚠️ 警告: 连接的链ID ({chain_id}) 与期望的{self.network_config['name']}链ID ({expected_chain_id}) 不匹配")
+                logger.error(f"⚠️ 警告: 连接的链ID ({chain_id}) 与期望的{self.network_config['name']}链ID ({expected_chain_id}) 不匹配")
             else:
-                print(f"✅ 成功连接{self.network_config['name']} (Chain ID: {chain_id})")
+                logger.info(f"✅ 成功连接{self.network_config['name']} (Chain ID: {chain_id})")
             
             return web3
             
         except Exception as e:
-            print(f"⚠️ Web3连接失败: {e}")
+            logger.error(f"⚠️ Web3连接失败: {e}")
             return None
     
     def is_contract_address(self, address):
@@ -255,7 +303,7 @@ class TokenDepositAnalyzer:
                 # 如果没有Web3连接，返回Unknown类型
                 return False, "Unknown"
         except Exception as e:
-            print(f"   ⚠️ 检查合约地址失败 {address}: {e}")
+            logger.error(f"   ⚠️ 检查合约地址失败 {address}: {e}")
             return False, "Unknown"
     
     def check_address_type(self, address):
@@ -279,7 +327,7 @@ class TokenDepositAnalyzer:
         Returns:
             list: 所有转账记录列表
         """
-        print(f"🔄 开始分段查询{self.token}转账（每段 {segment_minutes} 分钟）")
+        logger.info(f"🔄 开始分段查询{self.token}转账（每段 {segment_minutes} 分钟）")
         
         all_transfers = []
         segment_seconds = segment_minutes * 60
@@ -293,7 +341,7 @@ class TokenDepositAnalyzer:
             # 显示当前查询的时间段
             start_dt = datetime.fromtimestamp(current_start, tz=timezone.utc)
             end_dt = datetime.fromtimestamp(current_end, tz=timezone.utc)
-            print(f"\n📍 第{segment_count}段: {start_dt.strftime('%H:%M:%S')} - {end_dt.strftime('%H:%M:%S')} UTC")
+            logger.info(f"📍 第{segment_count}段: {start_dt.strftime('%H:%M:%S')} - {end_dt.strftime('%H:%M:%S')} UTC")
             
             try:
                 # 使用BlockTimeConverter获取当前时间段的区块范围
@@ -301,11 +349,11 @@ class TokenDepositAnalyzer:
                 end_block = self.block_converter.get_block_by_timestamp(current_end, 'after')
                 
                 if start_block is None or end_block is None:
-                    print(f"   ⚠️ 无法获取区块范围，跳过此时间段")
+                    logger.error(f"   ⚠️ 无法获取区块范围，跳过此时间段")
                     current_start = current_end
                     continue
                 
-                print(f"   📦 区块范围: {start_block:,} - {end_block:,}")
+                logger.info(f"   📦 区块范围: {start_block:,} - {end_block:,}")
                 
                 # 查询当前时间段的转账
                 segment_transfers = self._get_token_transfers_for_blocks(start_block, end_block)
@@ -318,23 +366,23 @@ class TokenDepositAnalyzer:
                         if current_start <= tx_timestamp <= current_end:
                             filtered_transfers.append(transfer)
                     
-                    print(f"   ✅ 获取到 {len(segment_transfers)} 笔转账，筛选后 {len(filtered_transfers)} 笔在目标时间内")
+                    logger.info(f"   ✅ 获取到 {len(segment_transfers)} 笔转账，筛选后 {len(filtered_transfers)} 笔在目标时间内")
                     all_transfers.extend(filtered_transfers)
                 else:
-                    print(f"   📝 此时间段无转账记录")
+                    logger.info(f"   📝 此时间段无转账记录")
                 
                 # 添加延时避免API限制
                 import time
                 time.sleep(0.2)  # 200ms延时
                 
             except Exception as e:
-                print(f"   ❌ 查询第{segment_count}段时出错: {e}")
+                logger.error(f"   ❌ 查询第{segment_count}段时出错: {e}")
             
             current_start = current_end
         
-        print(f"\n🎯 分段查询完成！")
-        print(f"   📊 总段数: {segment_count}")
-        print(f"   📦 总转账数: {len(all_transfers)}")
+        logger.info(f"🎯 分段查询完成！")
+        logger.info(f"   📊 总段数: {segment_count}")
+        logger.info(f"   📦 总转账数: {len(all_transfers)}")
         
         # 按时间戳降序排序
         all_transfers.sort(key=lambda x: int(x['timeStamp']), reverse=True)
@@ -371,11 +419,11 @@ class TokenDepositAnalyzer:
             if data['status'] == '1':
                 return data['result']
             else:
-                print(f"   ⚠️ API错误: {data.get('message', 'Unknown error')}")
+                logger.error(f"   ⚠️ API错误: {data.get('message', 'Unknown error')}")
                 return []
                 
         except Exception as e:
-            print(f"   ❌ 查询区块范围转账失败: {e}")
+            logger.error(f"   ❌ 查询区块范围转账失败: {e}")
             return []
 
     def get_token_transfers(self, page=1, per_page=5000):
@@ -389,7 +437,7 @@ class TokenDepositAnalyzer:
             list: 转账记录列表
         """
         try:
-            print(f"🔍 获取{self.token}转账记录 (页码: {page})")
+            logger.info(f"🔍 获取{self.token}转账记录 (页码: {page})")
             
             # 使用动态获取的区块范围
             start_block = self.start_block
@@ -411,35 +459,35 @@ class TokenDepositAnalyzer:
             response = requests.get(self.api_config["base_url"], params=params, timeout=30)
             data = response.json()
             
-            print(f"   API响应状态: {data.get('status')}, 消息: {data.get('message')}")
+            logger.info(f"   API响应状态: {data.get('status')}, 消息: {data.get('message')}")
             
             if data['status'] == '1':
                 transfers = data['result']
-                print(f"   📦 获取到 {len(transfers)} 笔转账")
+                logger.info(f"   📦 获取到 {len(transfers)} 笔转账")
                 return transfers
             else:
-                print(data)
-                print(f"   ❌ API错误: {data.get('message', 'Unknown error')}")
+                logger.info(data)
+                logger.error(f"   ❌ API错误: {data.get('message', 'Unknown error')}")
                 return []
                 
         except Exception as e:
-            print(f"   ❌ 获取转账失败: {e}")
+            logger.error(f"   ❌ 获取转账失败: {e}")
             return []
     
     def filter_recent_transfers(self, transfers):
         """筛选指定时间范围UTC的转账"""
         target_transfers = []
         
-        print(f"🔍 检查转账时间戳范围...")
+        logger.info(f"🔍 检查转账时间戳范围...")
         if transfers:
             first_tx = transfers[0]
             last_tx = transfers[-1]
             first_time = datetime.fromtimestamp(int(first_tx['timeStamp']), tz=timezone.utc)
             last_time = datetime.fromtimestamp(int(last_tx['timeStamp']), tz=timezone.utc)
-            print(f"   第一笔交易时间: {first_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
-            print(f"   最后一笔交易时间: {last_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
-            print(f"   目标开始时间: {datetime.fromtimestamp(self.start_time, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
-            print(f"   目标结束时间: {datetime.fromtimestamp(self.current_time, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
+            logger.info(f"   第一笔交易时间: {first_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+            logger.info(f"   最后一笔交易时间: {last_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+            logger.info(f"   目标开始时间: {datetime.fromtimestamp(self.start_time, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
+            logger.info(f"   目标结束时间: {datetime.fromtimestamp(self.current_time, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
         
         for transfer in transfers:
             tx_timestamp = int(transfer['timeStamp'])
@@ -449,10 +497,10 @@ class TokenDepositAnalyzer:
                 target_transfers.append(transfer)
             elif tx_timestamp < self.start_time:
                 # 如果时间戳小于开始时间且是降序，可以停止
-                print(f"   ⏹️ 时间戳 {tx_timestamp} 早于开始时间 {self.start_time}，停止搜索")
+                logger.info(f"   ⏹️ 时间戳 {tx_timestamp} 早于开始时间 {self.start_time}，停止搜索")
                 break
         
-        print(f"🕐 指定时间范围的转账: {len(target_transfers)} 笔")
+        logger.info(f"🕐 指定时间范围的转账: {len(target_transfers)} 笔")
         return target_transfers
     
     def filter_large_amounts(self, transfers):
@@ -471,7 +519,7 @@ class TokenDepositAnalyzer:
             except:
                 continue
         
-        print(f"💰 大于{self.min_amount} {self.token}的转账: {len(large_transfers)} 笔")
+        logger.info(f"💰 大于{self.min_amount} {self.token}的转账: {len(large_transfers)} 笔")
         return large_transfers
     
     def get_transaction_details(self, tx_hash):
@@ -519,37 +567,23 @@ class TokenDepositAnalyzer:
             }
             
         except Exception as e:
-            print(f"   ⚠️ 获取交易详情失败 {tx_hash[:10]}...: {e}")
+            logger.error(f"   ⚠️ 获取交易详情失败 {tx_hash[:10]}...: {e}")
             return None
     
     def analyze_deposit_transactions(self, transfers):
         """分析deposit交易"""
-        print(f"🔍 分析交易方法名和接收合约...")
+        logger.info(f"🔍 分析交易方法名和接收合约...")
         
         deposit_transfers = []
         method_counter = Counter()
         contract_counter = Counter()
         
-        # 预定义的DeFi协议合约地址（常见的支持USDT deposit的协议）
-        known_defi_contracts = {
-            '0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9': 'Aave LendingPool',
-            '0xf650C3d88D12dB855b8bf7D11Be6C55A4e07dCC9': 'Compound cUSDT',
-            '0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7': 'Curve 3Pool',
-            '0x7Da96a3891Add058AdA2E826306D812C638D87a6': 'Yearn USDT Vault',
-            '0x35D1b3F3D7966A1DFe207aa4514C12a259A0492B': 'MakerDAO Vault',
-            '0x111111125421cA6dc452d289314280a0f8842A65': '1inch Router',
-            '0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD': 'Uniswap Labs',
-            '0xE592427A0AEce92De3Edee1F18E0157C05861564': 'Uniswap V3 Router',
-            '0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45': 'Uniswap V3 Router 2',
-            '0x80a64c6D7f12C47B7c66c5B4E20E72bc1FCd5d9e': 'Curve Factory',
-            '0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F': 'SushiSwap Router',
-            '0x6B175474E89094C44Da98b954EedeAC495271d0F': 'DAI Token',
-            '0x853d955aCEf822Db058eb8505911ED77F175b99e': 'FRAX Token'
-        }
+        # 获取当前网络的DeFi协议配置
+        known_defi_contracts = get_all_defi_protocols(self.network)
         
         for i, transfer in enumerate(transfers, 1):
             if i % 10 == 0 or i == len(transfers):
-                print(f"   处理进度: {i}/{len(transfers)}")
+                logger.info(f"   处理进度: {i}/{len(transfers)}")
             
             to_address = transfer['to']
             
@@ -574,7 +608,7 @@ class TokenDepositAnalyzer:
                 transfer['contract_name'] = contract_name
                 transfer['is_defi_deposit'] = True
                 deposit_transfers.append(transfer)
-                print(f"   🏦 发现DeFi deposit: {transfer['amount_usdt']:,.0f} USDT → {contract_name}")
+                logger.info(f"   🏦 发现DeFi deposit: {transfer['amount_usdt']:,.0f} USDT → {contract_name}")
             else:
                 # 检查是否是合约地址
                 try:
@@ -588,27 +622,27 @@ class TokenDepositAnalyzer:
                                 transfer['is_defi_deposit'] = True
                                 deposit_transfers.append(transfer)
                                 contract_counter[contract_name] += 1
-                                print(f"   🏦 发现潜在DeFi deposit: {transfer['amount_usdt']:,.0f} USDT → {contract_name}")
+                                logger.info(f"   🏦 发现潜在DeFi deposit: {transfer['amount_usdt']:,.0f} USDT → {contract_name}")
                 except:
                     pass
             
             # 添加延迟避免RPC限制
             time.sleep(0.05)
         
-        print(f"\n📊 交易方法统计:")
+        logger.info(f"📊 交易方法统计:")
         for method, count in method_counter.most_common(10):
-            print(f"   {method}: {count} 笔")
+            logger.info(f"   {method}: {count} 笔")
         
-        print(f"\n🏦 DeFi协议统计:")
+        logger.info(f"🏦 DeFi协议统计:")
         for contract, count in contract_counter.most_common(10):
-            print(f"   {contract}: {count} 笔")
+            logger.info(f"   {contract}: {count} 笔")
         
-        print(f"\n🏦 DeFi Deposit交易: {len(deposit_transfers)} 笔")
+        logger.info(f"🏦 DeFi Deposit交易: {len(deposit_transfers)} 笔")
         return deposit_transfers
     
     def analyze_destination_contracts(self, deposit_transfers):
         """分析转入地址，统计合约地址"""
-        print(f"🔍 分析转入地址...")
+        logger.info(f"🔍 分析转入地址...")
         
         # 统计转入地址
         destination_counter = Counter()
@@ -641,7 +675,7 @@ class TokenDepositAnalyzer:
                             'name': 'Unknown'
                         }
                 except Exception as e:
-                    print(f"   ⚠️ 检查地址失败 {to_address}: {e}")
+                    logger.error(f"   ⚠️ 检查地址失败 {to_address}: {e}")
                     contract_info[to_address] = {
                         'is_contract': True,
                         'code_size': 0,
@@ -654,7 +688,7 @@ class TokenDepositAnalyzer:
             if contract_info.get(addr, {}).get('is_contract', False)
         }
         
-        print(f"📋 转入的合约地址数量: {len(contract_destinations)}")
+        logger.info(f"📋 转入的合约地址数量: {len(contract_destinations)}")
         
         # 获取前5名
         top_5_contracts = Counter(contract_destinations).most_common(5)
@@ -725,17 +759,17 @@ class TokenDepositAnalyzer:
     
     def format_results(self, deposit_transfers, top_5_contracts, contract_info, stats):
         """格式化并显示结果"""
-        print(f"\n📊 USDT大额Deposit交易分析结果")
-        print(f"{'='*80}")
-        print(f"⏰ 分析时间范围: 过去24小时")
-        print(f"💰 最小金额: {self.min_amount:,} USDT")
-        print(f"🏦 Deposit交易总数: {stats['total_transactions']:,} 笔")
-        print(f"💵 总金额: {stats['total_amount']:,.2f} USDT")
-        print(f"📈 平均金额: {stats['average_amount']:,.2f} USDT")
-        print(f"{'='*80}")
+        logger.info(f"📊 USDT大额Deposit交易分析结果")
+        logger.info(f"{'='*80}")
+        logger.info(f"⏰ 分析时间范围: 过去24小时")
+        logger.info(f"💰 最小金额: {self.min_amount:,} USDT")
+        logger.info(f"🏦 Deposit交易总数: {stats['total_transactions']:,} 笔")
+        logger.info(f"💵 总金额: {stats['total_amount']:,.2f} USDT")
+        logger.info(f"📈 平均金额: {stats['average_amount']:,.2f} USDT")
+        logger.info(f"{'='*80}")
         
-        print(f"\n🏆 转入地址最多的合约前5名:")
-        print(f"{'-'*80}")
+        logger.info(f"🏆 转入地址最多的合约前5名:")
+        logger.info(f"{'-'*80}")
         
         for i, (contract_address, count) in enumerate(top_5_contracts, 1):
             info = contract_info.get(contract_address, {})
@@ -748,21 +782,21 @@ class TokenDepositAnalyzer:
                 if Web3.to_checksum_address(transfer['to']) == contract_address
             )
             
-            print(f"#{i}. {contract_name}")
-            print(f"     🏠 地址: {contract_address}")
-            print(f"     📊 转入次数: {count} 次")
-            print(f"     💰 总金额: {total_amount:,.2f} USDT")
-            print(f"     📏 代码大小: {code_size:,} bytes")
-            print()
+            logger.info(f"#{i}. {contract_name}")
+            logger.info(f"     🏠 地址: {contract_address}")
+            logger.info(f"     📊 转入次数: {count} 次")
+            logger.info(f"     💰 总金额: {total_amount:,.2f} USDT")
+            logger.info(f"     📏 代码大小: {code_size:,} bytes")
+            logger.info("")
         
-        print(f"📈 金额分布:")
+        logger.info(f"📈 金额分布:")
         for range_name, count in stats['amount_ranges'].items():
-            print(f"   {range_name} USDT: {count} 笔")
+            logger.info(f"   {range_name} USDT: {count} 笔")
         
-        print(f"\n⏰ 24小时分布 (显示活跃时段):")
+        logger.info(f"⏰ 24小时分布 (显示活跃时段):")
         sorted_hours = sorted(stats['hour_distribution'].items(), key=lambda x: x[1], reverse=True)
         for hour, count in sorted_hours[:8]:  # 显示最活跃的8个小时
-            print(f"   {hour:02d}:00-{hour:02d}:59: {count} 笔")
+            logger.info(f"   {hour:02d}:00-{hour:02d}:59: {count} 笔")
     
     def save_results(self, deposit_transfers, top_5_contracts, contract_info, stats, output_dir="temp"):
         """保存结果到文件"""
@@ -843,19 +877,19 @@ class TokenDepositAnalyzer:
                     f.write(f"   转入次数: {count} 次\n")
                     f.write(f"   总金额: {total_amount:,.2f} USDT\n\n")
             
-            print(f"\n💾 结果已保存:")
-            print(f"   📄 详细数据: {json_filepath}")
-            print(f"   📝 文本报告: {txt_filepath}")
+            logger.info(f"💾 结果已保存:")
+            logger.info(f"   📄 详细数据: {json_filepath}")
+            logger.info(f"   📝 文本报告: {txt_filepath}")
             
             return json_filepath, txt_filepath
             
         except Exception as e:
-            print(f"⚠️ 保存文件失败: {e}")
+            logger.error(f"⚠️ 保存文件失败: {e}")
             return None, None
     
     def analyze_all_transfers(self, transfers):
         """分析所有转账，统计交互次数最多的合约"""
-        print(f"🔍 分析所有转账交易，统计交互次数...")
+        logger.info(f"🔍 分析所有转账交易，统计交互次数...")
         
         # 统计转入地址
         destination_counter = Counter()
@@ -863,7 +897,7 @@ class TokenDepositAnalyzer:
         
         for i, transfer in enumerate(transfers, 1):
             if i % 100 == 0 or i == len(transfers):
-                print(f"   处理进度: {i}/{len(transfers)}")
+                logger.info(f"   处理进度: {i}/{len(transfers)}")
             
             to_address = transfer['to']
             destination_counter[to_address] += 1
@@ -892,41 +926,41 @@ class TokenDepositAnalyzer:
             if contract_info[addr]['is_contract']
         }
         
-        print(f"📋 转入的合约地址数量: {len(contract_destinations)}")
+        logger.info(f"📋 转入的合约地址数量: {len(contract_destinations)}")
         
         return contract_destinations, destination_counter
     
     def analyze(self):
         """执行完整分析"""
         try:
-            print(f"🚀 开始分析{self.token}交易...")
-            print(f"⏰ 查询{self.start_time_str} 到 {self.end_time_str} UTC的{self.token}转账")
-            print(f"📊 筛选大于{self.min_amount} {self.token}的转账")
-            print(f"🎯 列出交互数量大于10的所有合约，按交互数量排序")
-            print("=" * 60)
+            logger.info(f"🚀 开始分析{self.token}交易...")
+            logger.info(f"⏰ 查询{self.start_time_str} 到 {self.end_time_str} UTC的{self.token}转账")
+            logger.info(f"📊 筛选大于{self.min_amount} {self.token}的转账")
+            logger.info(f"🎯 列出交互数量大于10的所有合约，按交互数量排序")
+            logger.info("=" * 60)
             
             # 使用分段查询获取代币转账记录
-            print(f"🔄 使用分段查询方式获取转账记录...")
+            logger.info(f"🔄 使用分段查询方式获取转账记录...")
             all_transfers = self.get_usdt_transfers_by_time_segments(segment_minutes=10)
             
             if not all_transfers:
-                print("❌ 未找到任何转账记录")
+                logger.error("❌ 未找到任何转账记录")
                 return
             
-            print(f"📦 获取到总计 {len(all_transfers)} 笔{self.token}转账")
+            logger.info(f"📦 获取到总计 {len(all_transfers)} 笔{self.token}转账")
             
             # 处理大于指定金额的转账
             processed_transfers = self.filter_large_amounts(all_transfers)
             
             if not processed_transfers:
-                print(f"❌ 未发现大于{self.min_amount} {self.token}的转账数据")
+                logger.error(f"❌ 未发现大于{self.min_amount} {self.token}的转账数据")
                 return
             
             # 分析所有转账，统计合约交互
             contract_destinations, destination_counter = self.analyze_all_transfers(processed_transfers)
             
             if not contract_destinations:
-                print(f"❌ 未发现转入合约地址的转账")
+                logger.error(f"❌ 未发现转入合约地址的转账")
                 return
             
             # 筛选交互数量大于10的合约，按交互数量排序
@@ -941,7 +975,7 @@ class TokenDepositAnalyzer:
                 reverse=True
             )
             
-            print(f"\n🎯 交互数量大于10的合约: {len(sorted_contracts)} 个")
+            logger.info(f"🎯 交互数量大于10的合约: {len(sorted_contracts)} 个")
             
             # 计算统计信息
             stats = {
@@ -961,35 +995,35 @@ class TokenDepositAnalyzer:
             # 保存结果
             self.save_filtered_results(processed_transfers, sorted_contracts, stats)
             
-            print(f"\n✅ 分析完成!")
+            logger.info(f"\n✅ 分析完成!")
             
         except Exception as e:
             raise Exception(f"分析失败: {e}")
     
     def format_filtered_results(self, all_transfers, sorted_contracts, stats):
         """格式化并显示筛选后的交易分析结果"""
-        print(f"\n📊 {self.token}交易分析结果")
-        print("=" * 80)
-        print(f"⏰ 分析时间范围: {stats['query_date']} UTC 全天")
-        print(f"💰 最小金额: {stats['min_amount']:,} USDT")
-        print(f"� 最小交互次数: {stats['min_interactions']} 次")
-        print(f"�🏦 总交易数: {stats['total_transactions']:,} 笔")
-        print(f"💵 总金额: {stats['total_amount']:,.2f} USDT")
-        print(f"📈 平均金额: {stats['average_amount']:,.2f} USDT")
-        print(f"🏗️ 总合约数: {stats['contract_count']} 个")
-        print(f"🎯 符合条件的合约数: {stats['filtered_contract_count']} 个")
-        print("=" * 80)
+        logger.info(f"📊 {self.token}交易分析结果")
+        logger.info("=" * 80)
+        logger.info(f"⏰ 分析时间范围: {stats['query_date']} UTC 全天")
+        logger.info(f"💰 最小金额: {stats['min_amount']:,} USDT")
+        logger.info(f"� 最小交互次数: {stats['min_interactions']} 次")
+        logger.info(f"�🏦 总交易数: {stats['total_transactions']:,} 笔")
+        logger.info(f"💵 总金额: {stats['total_amount']:,.2f} USDT")
+        logger.info(f"📈 平均金额: {stats['average_amount']:,.2f} USDT")
+        logger.info(f"🏗️ 总合约数: {stats['contract_count']} 个")
+        logger.info(f"🎯 符合条件的合约数: {stats['filtered_contract_count']} 个")
+        logger.info("=" * 80)
         
-        print(f"\n🏆 交互数量大于{stats['min_interactions']}的所有合约 (按交互数量排序):")
-        print("-" * 80)
+        logger.info(f"\n🏆 交互数量大于{stats['min_interactions']}的所有合约 (按交互数量排序):")
+        logger.info("-" * 80)
         for i, (address, info) in enumerate(sorted_contracts, 1):
-            print(f"#{i}. {info['name']}")
-            print(f"     🏠 地址: {address}")
-            print(f"     📊 交互次数: {info['transaction_count']} 次")
-            print(f"     💰 总金额: {info['total_amount']:,.2f} USDT")
-            print(f"     📏 平均金额: {info['total_amount']/info['transaction_count']:,.2f} USDT")
-            print(f"     📏 合约状态: {'✅ 已验证合约' if info['is_contract'] else '❌ 非合约地址'}")
-            print()
+            logger.info(f"#{i}. {info['name']}")
+            logger.info(f"     🏠 地址: {address}")
+            logger.info(f"     📊 交互次数: {info['transaction_count']} 次")
+            logger.info(f"     💰 总金额: {info['total_amount']:,.2f} USDT")
+            logger.info(f"     📏 平均金额: {info['total_amount']/info['transaction_count']:,.2f} USDT")
+            logger.info(f"     📏 合约状态: {'✅ 已验证合约' if info['is_contract'] else '❌ 非合约地址'}")
+            logger.info("")
         
         # 显示金额分布
         amount_ranges = {
@@ -1013,10 +1047,10 @@ class TokenDepositAnalyzer:
             elif amount >= 1000:
                 amount_ranges["1K-10K USDT"] += 1
         
-        print(f"📈 金额分布:")
+        logger.info(f"📈 金额分布:")
         for range_name, count in amount_ranges.items():
             if count > 0:  # 只显示有数据的范围
-                print(f"   {range_name}: {count} 笔")
+                logger.info(f"   {range_name}: {count} 笔")
         
         # 显示时间分布
         hour_distribution = {}
@@ -1026,10 +1060,10 @@ class TokenDepositAnalyzer:
             hour_distribution[hour] = hour_distribution.get(hour, 0) + 1
         
         if hour_distribution:
-            print(f"\n⏰ 24小时分布 (UTC时间，显示最活跃的8个时段):")
+            logger.info(f"\n⏰ 24小时分布 (UTC时间，显示最活跃的8个时段):")
             sorted_hours = sorted(hour_distribution.items(), key=lambda x: x[1], reverse=True)
             for hour, count in sorted_hours[:8]:
-                print(f"   {hour:02d}:00-{hour:02d}:59: {count} 笔")
+                logger.info(f"   {hour:02d}:00-{hour:02d}:59: {count} 笔")
     
     def save_filtered_results(self, all_transfers, sorted_contracts, stats, output_dir="temp"):
         """保存筛选后的结果到文件"""
@@ -1107,14 +1141,14 @@ class TokenDepositAnalyzer:
                     f.write(f"   总金额: {info['total_amount']:,.2f} USDT\n")
                     f.write(f"   平均金额: {info['total_amount']/info['transaction_count']:,.2f} USDT\n\n")
             
-            print(f"\n💾 结果已保存:")
-            print(f"   📄 详细数据: {json_filepath}")
-            print(f"   📝 文本报告: {txt_filepath}")
+            logger.info(f"\n💾 结果已保存:")
+            logger.info(f"   📄 详细数据: {json_filepath}")
+            logger.info(f"   📝 文本报告: {txt_filepath}")
             
             return json_filepath, txt_filepath
             
         except Exception as e:
-            print(f"⚠️ 保存文件失败: {e}")
+            logger.error(f"⚠️ 保存文件失败: {e}")
             return None, None
 
 def main():
@@ -1125,19 +1159,29 @@ def main():
     # 检查命令行参数
     if len(sys.argv) > 1 and sys.argv[1] in ['-h', '--help', 'help']:
         print("📖 功能说明:")
-        print("  分析指定UTC时间范围内的USDT转账")
+        print("  分析指定UTC时间范围内的代币转账")
         print("  筛选大于指定金额的交易")
-        print("  支持多个区块链网络")
+        print("  支持多个区块链网络和多种代币")
         print("  列出交互数量大于10的所有合约，按交互数量排序")
         print()
         print("📝 使用方法:")
-        print(f"  python {sys.argv[0]} [start_time_utc] [end_time_utc] [min_amount] [network]")
+        print(f"  python {sys.argv[0]} [start_time_utc] [end_time_utc] [min_amount] [network] [token]")
         print()
         print("🌐 支持的网络:")
         print("  - ethereum (默认) - 以太坊主网")
         print("  - arbitrum       - Arbitrum One")
         print("  - base           - Base") 
         print("  - bsc            - BNB Smart Chain")
+        print()
+        print("🪙 支持的代币:")
+        print("  - USDT (默认)    - Tether USD")
+        print("  - USDC           - USD Coin")
+        print("  - DAI            - Dai Stablecoin")
+        print("  - WETH           - Wrapped Ether")
+        print("  - WBTC           - Wrapped Bitcoin")
+        print("  - UNI            - Uniswap Token")
+        print("  - LINK           - Chainlink Token")
+        print("  ⚠️  注意：不同网络支持的代币可能不同，请确认代币在目标网络上可用")
         print()
         print("🕐 UTC时间格式:")
         print("  - YYYY-MM-DD HH:MM:SS  (如: 2025-10-24 00:00:00)")
@@ -1146,8 +1190,8 @@ def main():
         print("  ⚠️  注意：所有时间均为UTC时间，请确保输入正确的UTC时间")
         print()
         print("💰 最小金额:")
-        print("  - 数字形式，单位为USDT (如: 1000, 500, 10000)")
-        print("  - 默认值: 1000 USDT")
+        print("  - 数字形式，单位为所选代币 (如: 1000, 500, 10000)")
+        print("  - 默认值: 1000 (代币单位)")
         print()
         print("🔧 环境变量配置 (.env文件):")
         print("  # 通用API密钥")
@@ -1163,7 +1207,7 @@ def main():
         print("  BSC_RPC_URL=https://bsc-dataseed1.binance.org")
         print()
         print("📊 分析内容:")
-        print("  - 指定UTC时间范围的USDT转账记录")
+        print("  - 指定UTC时间范围的代币转账记录")
         print("  - 筛选 >= 指定金额的转账")
         print("  - 统计转入合约地址的交互次数")
         print("  - 列出交互次数 > 10的所有合约")
@@ -1171,13 +1215,15 @@ def main():
         print("  - 保存详细结果到文件")
         print()
         print("📋 示例:")
-        print(f"  # 以太坊主网分析")
+        print(f"  # 以太坊主网USDT分析")
         print(f"  python {sys.argv[0]} '2025-10-24 00:00:00' '2025-10-24 23:59:59'")
-        print(f"  # Arbitrum网络分析")
-        print(f"  python {sys.argv[0]} '2025-10-24 00:00:00' '2025-10-24 23:59:59' 1000 arbitrum")
-        print(f"  # BSC网络大额交易分析")
-        print(f"  python {sys.argv[0]} '2025-10-24' '2025-10-25' 10000 bsc")
-        print("  # 分析2024年10月24日UTC全天，筛选大于10000 USDT的交易")
+        print(f"  # Arbitrum网络USDC分析")
+        print(f"  python {sys.argv[0]} '2025-10-24 00:00:00' '2025-10-24 23:59:59' 1000 arbitrum USDC")
+        print(f"  # BSC网络大额USDT交易分析")
+        print(f"  python {sys.argv[0]} '2025-10-24' '2025-10-25' 10000 bsc USDT")
+        print(f"  # 以太坊主网DAI代币分析")
+        print(f"  python {sys.argv[0]} '2025-10-24 00:00:00' '2025-10-24 23:59:59' 1000 ethereum DAI")
+        print("  # 分析2024年10月24日UTC全天，筛选大于10000的指定代币交易")
         return
     
     try:
@@ -1212,32 +1258,19 @@ def main():
                 else:
                     print(f"⚠️ 警告: 不支持的网络 '{network}'，使用默认网络 ethereum")
                     network = 'ethereum'
+            else:
+                print(f"   网络: {network} (默认)")
             
             # 检查是否提供了代币参数
             if len(sys.argv) >= 6:
                 token = sys.argv[5].upper()
                 print(f"   代币: {token}")
-                try:
-                    min_amount = float(sys.argv[3])
-                    print(f"   最小金额: {min_amount} USDT")
-                except ValueError:
-                    print(f"⚠️ 警告: 无效的最小金额参数 '{sys.argv[3]}'，使用默认值1000 USDT")
-                    min_amount = None
-            
-            # 检查是否提供了网络参数
-            if len(sys.argv) >= 5:
-                network = sys.argv[4].lower()
-                if network not in ['ethereum', 'arbitrum', 'base', 'bsc']:
-                    print(f"⚠️ 警告: 不支持的网络 '{sys.argv[4]}'，使用默认以太坊主网")
-                    network = 'ethereum'
-                else:
-                    print(f"   网络: {network}")
             else:
-                print(f"   网络: {network} (默认)")
+                print(f"   代币: {token} (默认)")
         else:
             # 使用默认时间范围或交互式输入
             print("📝 未指定时间参数，将使用默认UTC时间范围 2025-10-24")
-            print("   如需指定UTC时间，请使用: python usdt_deposit_analyzer.py '开始时间UTC' '结束时间UTC' [最小金额] [网络]")
+            print("   如需指定UTC时间，请使用: python usdt_deposit_analyzer.py '开始时间UTC' '结束时间UTC' [最小金额] [网络] [代币]")
             
             # 可选择交互式输入
             user_input = input("是否要手动输入UTC时间范围？(y/N): ").strip().lower()
@@ -1245,8 +1278,9 @@ def main():
                 print("请输入UTC时间（所有时间均为UTC时区）：")
                 start_time = input("开始时间UTC (如 2025-10-24 00:00:00): ").strip()
                 end_time = input("结束时间UTC (如 2025-10-24 23:59:59): ").strip()
-                min_amount_input = input("最小金额USDT (如 1000，留空使用默认值): ").strip()
+                min_amount_input = input("最小金额 (如 1000，留空使用默认值): ").strip()
                 network_input = input("网络 (ethereum/arbitrum/base/bsc，留空默认ethereum): ").strip().lower()
+                token_input = input("代币 (USDT/USDC/DAI等，留空默认USDT): ").strip().upper()
                 
                 if not start_time or not end_time:
                     print("❌ 时间不能为空，使用默认UTC时间范围")
@@ -1265,6 +1299,12 @@ def main():
                     print(f"   选择网络: {network}")
                 else:
                     print(f"   使用默认网络: {network}")
+                
+                if token_input:
+                    token = token_input
+                    print(f"   选择代币: {token}")
+                else:
+                    print(f"   使用默认代币: {token}")
         
         # 创建分析器实例
         analyzer = TokenDepositAnalyzer(start_time, end_time, min_amount, network, token)

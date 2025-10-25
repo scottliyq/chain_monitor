@@ -9,6 +9,7 @@ TOKEN_CONTRACTS = {
         "USDC": "0xA0b86a33E6441b57ee3e4BEd34CE66fcEe8d5c4",
         "DAI": "0x6B175474E89094C44Da98b954EedeAC495271d0F",
         "WETH": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+        "LINK": "0x514910771AF9Ca656af840dff83E8264EcF986CA",
     },
     
     # Arbitrum One (Chain ID: 42161)
@@ -50,6 +51,7 @@ TOKEN_DECIMALS = {
         "USDC": 6,
         "DAI": 18,
         "WETH": 18,
+        "LINK": 18,
     },
     
     # Arbitrum One (Chain ID: 42161)
@@ -186,6 +188,105 @@ def get_token_decimals(chain: str, token: str) -> int:
     chain_decimals = TOKEN_DECIMALS.get(chain, {})
     return chain_decimals.get(token, 6)  # 默认返回6位小数
 
+def get_defi_protocol_name(chain: str, address: str) -> str:
+    """
+    获取指定链上DeFi协议地址的名称
+    
+    Args:
+        chain (str): 链名称 ("ethereum", "arbitrum", "base", "bsc")
+        address (str): 协议合约地址
+        
+    Returns:
+        str: 协议名称，如果未找到返回 "Unknown"
+    """
+    chain_protocols = DEFI_PROTOCOLS.get(chain, {})
+    return chain_protocols.get(address, "Unknown")
+
+def get_all_defi_protocols(chain: str) -> dict:
+    """
+    获取指定链的所有已知DeFi协议
+    
+    Args:
+        chain (str): 链名称 ("ethereum", "arbitrum", "base", "bsc")
+        
+    Returns:
+        dict: 该链的所有DeFi协议映射
+    """
+    return DEFI_PROTOCOLS.get(chain, {})
+
+def is_defi_protocol(chain: str, address: str) -> bool:
+    """
+    检查地址是否是指定链的已知DeFi协议
+    
+    Args:
+        chain (str): 链名称 ("ethereum", "arbitrum", "base", "bsc")
+        address (str): 合约地址
+        
+    Returns:
+        bool: 如果是已知DeFi协议返回 True，否则返回 False
+    """
+    chain_protocols = DEFI_PROTOCOLS.get(chain, {})
+    return address in chain_protocols
+
+# 已知的DeFi协议合约地址（按网络分类，用于识别deposit操作）
+DEFI_PROTOCOLS = {
+    # Ethereum Mainnet (Chain ID: 1)
+    "ethereum": {
+        '0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9': 'Aave LendingPool',
+        '0xf650C3d88D12dB855b8bf7D11Be6C55A4e07dCC9': 'Compound cUSDT',
+        '0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7': 'Curve 3Pool',
+        '0x7Da96a3891Add058AdA2E826306D812C638D87a6': 'Yearn USDT Vault',
+        '0x35D1b3F3D7966A1DFe207aa4514C12a259A0492B': 'MakerDAO Vault',
+        '0x111111125421cA6dc452d289314280a0f8842A65': '1inch Router',
+        '0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD': 'Uniswap Labs',
+        '0xE592427A0AEce92De3Edee1F18E0157C05861564': 'Uniswap V3 Router',
+        '0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45': 'Uniswap V3 Router 2',
+        '0x80a64c6D7f12C47B7c66c5B4E20E72bc1FCd5d9e': 'Curve Factory',
+        '0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F': 'SushiSwap Router',
+        '0x6B175474E89094C44Da98b954EedeAC495271d0F': 'DAI Token',
+        '0x853d955aCEf822Db058eb8505911ED77F175b99e': 'FRAX Token'
+    },
+    
+    # Arbitrum One (Chain ID: 42161)
+    "arbitrum": {
+        # GMX相关协议
+        '0x489ee077994B6658eAfA855C308275EAd8097C4A': 'GMX Vault',
+        '0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a': 'GMX Router',
+        
+        # Radiant Capital
+        '0xF4B1486DD74D07706052A33d31d7c0AAFD0659E1': 'Radiant V2 Pool',
+        
+        # Uniswap V3 on Arbitrum
+        '0xE592427A0AEce92De3Edee1F18E0157C05861564': 'Uniswap V3 Router',
+        '0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45': 'Uniswap V3 Router 2',
+    },
+    
+    # Base (Chain ID: 8453)
+    "base": {
+        # Aerodrome Finance
+        '0x940181a94A35A4569E4529A3CDfB74e38FD98631': 'Aerodrome Router',
+        '0x827922686190790b37229fd06084350E74485b72': 'Aerodrome Pool',
+        
+        # Compound V3
+        '0x9c4ec768c28520B50860ea7a15bd7213a9fF58bf': 'Compound V3 USDC',
+        
+        # Uniswap V3 on Base
+        '0x2626664c2603336E57B271c5C0b26F421741e481': 'Uniswap V3 Router',
+    },
+    
+    # BSC (Chain ID: 56)
+    "bsc": {
+        # PancakeSwap
+        '0x10ED43C718714eb63d5aA57B78B54704E256024E': 'PancakeSwap V2 Router',
+        '0x1b81D678ffb9C0263b24A97847620C99d213eB14': 'PancakeSwap V3 Router',
+        
+        # Venus Protocol
+        '0xfD36E2c2a6789Db23113685031d7F16329158384': 'Venus Comptroller',
+        '0xecA88125a5ADbe82614ffC12D0DB554E2e2867C8': 'Venus vUSDC',
+        '0xfD5840Cd36d94D7229439859C0112a4185BC0255': 'Venus vUSDT',
+    }
+}
+
 # 已知的合约类型映射（按网络分类，用于识别合约类型）
 KNOWN_CONTRACTS = {
     # Ethereum Mainnet (Chain ID: 1)
@@ -195,6 +296,8 @@ KNOWN_CONTRACTS = {
         "0x11b815efB8f581194ae79006d24E0d814B7697F6": "UniswapV3Pool", 
         "0xc7bBeC68d12a0d1830360F8Ec58fA599bA1b0e9b": "UniswapV3Pool",
         "0x33676385160f9d8f03a0db2821029882f7c79e93": "UniswapV3Pool",
+        "0xa6Cc3C2531FdaA6Ae1A3CA84c2855806728693e8": "LINK_ETH_UniswapV3Pool",
+        "0xfAd57d2039C21811C8F2B5D5B65308aa99D31559": "LINK_USDC_UniswapV3Pool",
         
         # Aave V3
         "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2": "AaveV3Pool",
@@ -203,6 +306,13 @@ KNOWN_CONTRACTS = {
         # Compound V3
         "0xc3d688B66703497DAA19211EEdff47f25384cdc3": "CompoundV3",
         "0xA17581A9E3356d9A858b789D68B4d866e593aE94": "CompoundV3",
+        
+        # Chainlink related contracts
+        "0x514910771AF9Ca656af840dff83E8264EcF986CA": "LINK_Token",
+        "0x271bF4f21f2E6b842b2b2A9DDDA7DD1E0C8E9E3E": "Chainlink_Aggregator",
+        "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419": "ETH_USD_Chainlink",
+        "0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c": "BTC_USD_Chainlink",
+        "0x2c1d072e956AFFC0D435Cb7AC38EF18d24d9127c": "LINK_USD_Chainlink",
         
         # Curve Finance
         "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7": "Curve3Pool",

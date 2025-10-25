@@ -9,11 +9,59 @@ import os
 import sys
 import time
 import json
+import logging
 import schedule
 from datetime import datetime, timedelta, timezone
+from logging.handlers import TimedRotatingFileHandler
 from collections import Counter
 from usdt_deposit_analyzer import TokenDepositAnalyzer
-from address_constant import get_contract_name, get_all_known_contracts, TOKEN_CONTRACTS, get_token_address
+from address_constant import get_contract_name, get_all_known_contracts, TOKEN_CONTRACTS, get_token_address, get_defi_protocol_name, get_all_defi_protocols, is_defi_protocol
+
+# 配置日志
+def setup_logging():
+    """设置日志配置，支持控制台输出和每日轮转的文件输出"""
+    # 创建logs目录
+    log_dir = 'logs'
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # 创建logger
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    
+    # 清除可能已存在的处理器
+    if logger.handlers:
+        logger.handlers.clear()
+    
+    # 创建格式器
+    formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # 控制台处理器
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    
+    # 文件处理器 - 每日轮转，保留7天
+    file_handler = TimedRotatingFileHandler(
+        filename=os.path.join(log_dir, 'protocol_monitor.log'),
+        when='midnight',      # 每天午夜轮转
+        interval=1,           # 每1天轮转一次
+        backupCount=7,        # 保留7天的日志文件
+        encoding='utf-8'
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    
+    # 添加处理器到logger
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+    
+    return logger
+
+# 初始化日志
+logger = setup_logging()
 
 class ConfigurableProtocolMonitor:
     def __init__(self, network="ethereum", token="USDT", min_amount=1000, 
@@ -41,14 +89,14 @@ class ConfigurableProtocolMonitor:
         # 验证配置
         self._validate_config()
         
-        print(f"🔍 可配置协议监控器已启动")
-        print(f"   网络: {network.upper()}")
-        print(f"   代币: {token}")
-        print(f"   最小金额: {min_amount} {token}")
-        print(f"   时间窗口: {time_window_minutes} 分钟")
-        print(f"   监控间隔: {monitor_interval_minutes} 分钟")
-        print(f"   输出目录: {output_dir}")
-        print()
+        logger.info(f"🔍 可配置协议监控器已启动")
+        logger.info(f"   网络: {network.upper()}")
+        logger.info(f"   代币: {token}")
+        logger.info(f"   最小金额: {min_amount} {token}")
+        logger.info(f"   时间窗口: {time_window_minutes} 分钟")
+        logger.info(f"   监控间隔: {monitor_interval_minutes} 分钟")
+        logger.info(f"   输出目录: {output_dir}")
+        logger.info("")
     
     def _validate_config(self):
         """验证配置参数的有效性"""
@@ -74,8 +122,8 @@ class ConfigurableProtocolMonitor:
         if self.monitor_interval_minutes <= 0:
             raise ValueError("监控间隔必须大于0分钟")
         
-        print(f"✅ 配置验证通过")
-        print(f"   代币地址: {token_address}")
+        logger.info(f"✅ 配置验证通过")
+        logger.info(f"   代币地址: {token_address}")
         
         # 初始化地址类型缓存
         self.address_type_cache = {}
@@ -142,12 +190,12 @@ class ConfigurableProtocolMonitor:
     def analyze_recent_activity(self):
         """分析指定时间窗口的代币活动"""
         try:
-            print(f"🚀 开始分析最近{self.time_window_minutes}分钟的{self.token}活动...")
-            print(f"⏰ 时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
+            logger.info(f"🚀 开始分析最近{self.time_window_minutes}分钟的{self.token}活动...")
+            logger.info(f"⏰ 时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
             
             # 获取时间窗口
             start_time, end_time = self.get_time_window()
-            print(f"📅 分析时间窗口: {start_time} 到 {end_time} UTC")
+            logger.info(f"📅 分析时间窗口: {start_time} 到 {end_time} UTC")
             
             # 创建分析器实例
             analyzer = TokenDepositAnalyzer(
@@ -163,29 +211,29 @@ class ConfigurableProtocolMonitor:
             
             # 获取转账记录，使用动态分段时间
             segment_minutes = max(10, self.time_window_minutes)  # 至少10分钟分段
-            print(f"🔄 获取{self.token}转账记录（分段时间: {segment_minutes}分钟）...")
+            logger.info(f"🔄 获取{self.token}转账记录（分段时间: {segment_minutes}分钟）...")
             all_transfers = analyzer.get_usdt_transfers_by_time_segments(segment_minutes=segment_minutes)
             
             if not all_transfers:
-                print("❌ 未找到任何转账记录")
+                logger.error("❌ 未找到任何转账记录")
                 return None
             
-            print(f"📦 获取到 {len(all_transfers)} 笔转账")
+            logger.info(f"📦 获取到 {len(all_transfers)} 笔转账")
             
             # 筛选大额转账
             large_transfers = analyzer.filter_large_amounts(all_transfers)
             
             if not large_transfers:
-                print(f"❌ 未发现大于{self.min_amount} {self.token}的转账")
+                logger.error(f"❌ 未发现大于{self.min_amount} {self.token}的转账")
                 return None
             
-            print(f"💰 大于{self.min_amount} {self.token}的转账: {len(large_transfers)} 笔")
+            logger.info(f"💰 大于{self.min_amount} {self.token}的转账: {len(large_transfers)} 笔")
             
             # 分析协议交互
             protocol_stats = self.analyze_protocol_interactions(large_transfers)
             
             if not protocol_stats:
-                print("❌ 未发现协议交互")
+                logger.error("❌ 未发现协议交互")
                 return None
             
             # 生成报告
@@ -194,11 +242,11 @@ class ConfigurableProtocolMonitor:
             # 保存结果
             self.save_results(report)
             
-            print(f"✅ 分析完成，发现 {len(protocol_stats)} 个活跃协议")
+            logger.info(f"✅ 分析完成，发现 {len(protocol_stats)} 个活跃协议")
             return report
             
         except Exception as e:
-            print(f"❌ 分析失败: {e}")
+            logger.error(f"❌ 分析失败: {e}")
             import traceback
             traceback.print_exc()
             return None
@@ -212,7 +260,7 @@ class ConfigurableProtocolMonitor:
         Returns:
             list: 按交互次数排序的协议统计
         """
-        print(f"🔍 分析协议交互...")
+        logger.info(f"🔍 分析协议交互...")
         
         # 统计每个地址的交互
         address_stats = {}
@@ -260,7 +308,7 @@ class ConfigurableProtocolMonitor:
         # 按交互次数降序排序，同时优先显示合约地址
         filtered_stats.sort(key=lambda x: (x['is_contract'], x['interaction_count']), reverse=True)
         
-        print(f"📊 发现 {len(filtered_stats)} 个活跃协议/合约")
+        logger.info(f"📊 发现 {len(filtered_stats)} 个活跃协议/合约")
         
         return filtered_stats
     
@@ -402,25 +450,25 @@ class ConfigurableProtocolMonitor:
                 f.write(f"      占比: {protocol['percentage_of_total']:.1f}%\n")
                 f.write(f"\n")
         
-        print(f"💾 结果已保存:")
-        print(f"   📄 详细报告: {json_filepath}")
-        print(f"   📝 文本报告: {txt_filepath}")
-        print(f"   📋 最新报告: {latest_txt}")
+        logger.info(f"💾 结果已保存:")
+        logger.info(f"   📄 详细报告: {json_filepath}")
+        logger.info(f"   📝 文本报告: {txt_filepath}")
+        logger.info(f"   📋 最新报告: {latest_txt}")
     
     def display_summary(self, report):
         """显示摘要信息"""
         if not report:
             return
         
-        print(f"\n📊 监控摘要:")
-        print(f"   配置: {report['configuration']['network'].upper()} {report['configuration']['token']}")
-        print(f"   时间窗口: {report['analysis_period']['start_time']} - {report['analysis_period']['end_time']} UTC")
-        print(f"   窗口长度: {report['configuration']['time_window_minutes']} 分钟")
-        print(f"   总转账: {report['summary']['total_transfers']} 笔")
-        print(f"   总金额: {report['summary']['total_amount']:,.0f} {self.token}")
-        print(f"   活跃协议: {report['summary']['active_protocols']} 个")
+        logger.info(f"\n📊 监控摘要:")
+        logger.info(f"   配置: {report['configuration']['network'].upper()} {report['configuration']['token']}")
+        logger.info(f"   时间窗口: {report['analysis_period']['start_time']} - {report['analysis_period']['end_time']} UTC")
+        logger.info(f"   窗口长度: {report['configuration']['time_window_minutes']} 分钟")
+        logger.info(f"   总转账: {report['summary']['total_transfers']} 笔")
+        logger.info(f"   总金额: {report['summary']['total_amount']:,.0f} {self.token}")
+        logger.info(f"   活跃协议: {report['summary']['active_protocols']} 个")
         
-        print(f"\n🏆 TOP 5 活跃协议:")
+        logger.info(f"\n🏆 TOP 5 活跃协议:")
         for protocol in report['protocol_rankings'][:5]:
             if protocol['protocol_name'] != 'Unknown':
                 name_display = protocol['protocol_name']
@@ -434,30 +482,30 @@ class ConfigurableProtocolMonitor:
             # 地址类型标识
             addr_type = "📄" if protocol['is_contract'] else "👤"  # 📄 = 合约, 👤 = EOA
             
-            print(f"   #{protocol['rank']}. {name_display} {addr_type} ({short_addr}) - {protocol['interaction_count']} 次交互")
-        print()
+            logger.info(f"   #{protocol['rank']}. {name_display} {addr_type} ({short_addr}) - {protocol['interaction_count']} 次交互")
+        logger.info("")
     
     def run_monitoring_cycle(self):
         """运行一次监控周期"""
-        print(f"{'='*80}")
-        print(f"🔄 开始新的监控周期")
-        print(f"⏰ 当前时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
-        print(f"📋 配置: {self.network.upper()} {self.token} (窗口: {self.time_window_minutes}分钟)")
+        logger.info(f"{'='*80}")
+        logger.info(f"🔄 开始新的监控周期")
+        logger.info(f"⏰ 当前时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        logger.info(f"📋 配置: {self.network.upper()} {self.token} (窗口: {self.time_window_minutes}分钟)")
         
         report = self.analyze_recent_activity()
         self.display_summary(report)
         
-        print(f"✅ 监控周期完成")
-        print(f"{'='*80}")
-        print()
+        logger.info(f"✅ 监控周期完成")
+        logger.info(f"{'='*80}")
+        logger.info("")
     
     def start_monitoring(self):
         """开始监控"""
-        print(f"🚀 启动可配置协议监控...")
-        print(f"   每{self.monitor_interval_minutes}分钟执行一次分析")
-        print(f"   分析窗口: {self.time_window_minutes}分钟")
-        print(f"   按 Ctrl+C 停止监控")
-        print()
+        logger.info(f"🚀 启动可配置协议监控...")
+        logger.info(f"   每{self.monitor_interval_minutes}分钟执行一次分析")
+        logger.info(f"   分析窗口: {self.time_window_minutes}分钟")
+        logger.info(f"   按 Ctrl+C 停止监控")
+        logger.info("")
         
         # 立即执行一次
         self.run_monitoring_cycle()
@@ -471,14 +519,14 @@ class ConfigurableProtocolMonitor:
                 schedule.run_pending()
                 time.sleep(10)  # 每10秒检查一次
             except KeyboardInterrupt:
-                print("\n🛑 收到停止信号，正在关闭监控...")
+                logger.info("\n🛑 收到停止信号，正在关闭监控...")
                 break
             except Exception as e:
-                print(f"❌ 监控过程中出错: {e}")
-                print("⏳ 等待下次周期...")
+                logger.error(f"❌ 监控过程中出错: {e}")
+                logger.info("⏳ 等待下次周期...")
                 time.sleep(60)  # 出错后等待1分钟
         
-        print("👋 协议监控已停止")
+        logger.info("👋 协议监控已停止")
 
 def main():
     """主函数"""
@@ -546,7 +594,7 @@ def main():
             try:
                 min_amount = float(sys.argv[3])
             except ValueError:
-                print(f"⚠️ 警告: 无效的最小金额参数 '{sys.argv[3]}'，使用默认值1000")
+                logger.error(f"⚠️ 警告: 无效的最小金额参数 '{sys.argv[3]}'，使用默认值1000")
                 min_amount = 1000
         
         if len(sys.argv) >= 5:
@@ -555,7 +603,7 @@ def main():
                 if time_window <= 0:
                     raise ValueError("时间窗口必须大于0")
             except ValueError:
-                print(f"⚠️ 警告: 无效的时间窗口参数 '{sys.argv[4]}'，使用默认值5分钟")
+                logger.error(f"⚠️ 警告: 无效的时间窗口参数 '{sys.argv[4]}'，使用默认值5分钟")
                 time_window = 5
         
         if len(sys.argv) >= 6:
@@ -564,7 +612,7 @@ def main():
                 if interval <= 0:
                     raise ValueError("监控间隔必须大于0")
             except ValueError:
-                print(f"⚠️ 警告: 无效的监控间隔参数 '{sys.argv[5]}'，使用默认值5分钟")
+                logger.error(f"⚠️ 警告: 无效的监控间隔参数 '{sys.argv[5]}'，使用默认值5分钟")
                 interval = 5
         
         print(f"📅 监控配置:")
@@ -587,7 +635,7 @@ def main():
         monitor.start_monitoring()
         
     except Exception as e:
-        print(f"\n❌ 错误: {e}")
+        logger.error(f"\n❌ 错误: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":
