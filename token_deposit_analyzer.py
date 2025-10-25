@@ -21,6 +21,14 @@ from dotenv import load_dotenv
 from block_time_converter import BlockTimeConverter
 from address_constant import KNOWN_CONTRACTS, USDT_CONTRACT_ADDRESS, TOKEN_CONTRACTS, get_token_address, get_contract_name, get_token_decimals, get_defi_protocol_name, get_all_defi_protocols, is_defi_protocol
 
+# 导入地址标签查询器
+try:
+    from sqlite_address_querier import SQLiteAddressLabelQuerier
+    HAS_ADDRESS_QUERIER = True
+except ImportError:
+    print("⚠️ sqlite_address_querier.py 未找到，地址标签功能将被禁用")
+    HAS_ADDRESS_QUERIER = False
+
 # 配置日志
 def setup_logging():
     """设置日志配置，支持控制台输出和每日轮转的文件输出"""
@@ -801,12 +809,66 @@ class TokenDepositAnalyzer:
             logger.info(f"   {hour:02d}:00-{hour:02d}:59: {count} 笔")
     
     def save_results(self, deposit_transfers, top_5_contracts, contract_info, stats, output_dir="temp"):
-        """保存结果到文件"""
+        """保存结果到文件，包含地址标签查询"""
         try:
             os.makedirs(output_dir, exist_ok=True)
             
+            # 初始化地址标签查询器
+            address_querier = None
+            if HAS_ADDRESS_QUERIER:
+                try:
+                    address_querier = SQLiteAddressLabelQuerier('address_labels.db')
+                    logger.info("🏷️ 地址标签查询器已启用")
+                except Exception as e:
+                    logger.warning(f"⚠️ 地址标签查询器初始化失败: {e}")
+            
             # 生成文件名 - 包含网络和代币名称
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            
+            # 查询地址标签（为TOP5合约添加标签）
+            enriched_top5 = []
+            for i, (addr, count) in enumerate(top_5_contracts, 1):
+                info = contract_info.get(addr, {})
+                total_amount = sum(
+                    transfer['amount_usdt'] for transfer in deposit_transfers
+                    if Web3.to_checksum_address(transfer['to']) == addr
+                )
+                
+                contract_data = {
+                    'rank': i,
+                    'address': addr,
+                    'name': info.get('name', 'Unknown'),
+                    'transaction_count': count,
+                    'total_amount': total_amount,
+                    'is_contract': info.get('is_contract', False),
+                    'code_size': info.get('code_size', 0)
+                }
+                
+                # 查询地址标签
+                if address_querier:
+                    try:
+                        label_info = address_querier.get_address_label(addr, self.network)
+                        contract_data.update({
+                            'address_label': label_info.get('label', 'Unknown Address'),
+                            'address_type': label_info.get('type', 'unknown'),
+                            'label_source': label_info.get('source', 'unknown')
+                        })
+                        logger.info(f"📛 {addr[:10]}...{addr[-8:]}: {label_info.get('label', 'Unknown')}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 查询地址标签失败 {addr}: {e}")
+                        contract_data.update({
+                            'address_label': 'Query Failed',
+                            'address_type': 'unknown',
+                            'label_source': 'error'
+                        })
+                else:
+                    contract_data.update({
+                        'address_label': info.get('name', 'Unknown'),
+                        'address_type': 'contract' if info.get('is_contract', False) else 'unknown',
+                        'label_source': 'local'
+                    })
+                
+                enriched_top5.append(contract_data)
             
             # 保存详细数据
             result = {
@@ -815,22 +877,9 @@ class TokenDepositAnalyzer:
                 'min_amount': self.min_amount,
                 'network': self.network,
                 'token': self.token,
+                'address_labels_enabled': HAS_ADDRESS_QUERIER,
                 'statistics': stats,
-                'top_5_contracts': [
-                    {
-                        'rank': i,
-                        'address': addr,
-                        'name': contract_info.get(addr, {}).get('name', 'Unknown'),
-                        'transaction_count': count,
-                        'total_amount': sum(
-                            transfer['amount_usdt'] for transfer in deposit_transfers
-                            if Web3.to_checksum_address(transfer['to']) == addr
-                        ),
-                        'is_contract': contract_info.get(addr, {}).get('is_contract', False),
-                        'code_size': contract_info.get(addr, {}).get('code_size', 0)
-                    }
-                    for i, (addr, count) in enumerate(top_5_contracts, 1)
-                ],
+                'top_5_contracts': enriched_top5,
                 'all_deposit_transactions': [
                     {
                         'hash': tx['hash'],
@@ -868,20 +917,27 @@ class TokenDepositAnalyzer:
                 f.write(f"最小金额: {self.min_amount:,} {self.token}\n")
                 f.write(f"Deposit交易数: {stats['total_transactions']} 笔\n")
                 f.write(f"总金额: {stats['total_amount']:,.2f} {self.token}\n")
-                f.write(f"平均金额: {stats['average_amount']:,.2f} {self.token}\n\n")
+                f.write(f"平均金额: {stats['average_amount']:,.2f} {self.token}\n")
+                f.write(f"地址标签功能: {'启用' if HAS_ADDRESS_QUERIER else '禁用'}\n\n")
                 
                 f.write(f"转入地址最多的合约前5名:\n")
                 f.write(f"{'-'*50}\n")
-                for i, (addr, count) in enumerate(top_5_contracts, 1):
-                    info = contract_info.get(addr, {})
-                    total_amount = sum(
-                        transfer['amount_usdt'] for transfer in deposit_transfers
-                        if Web3.to_checksum_address(transfer['to']) == addr
-                    )
-                    f.write(f"{i}. {info.get('name', 'Unknown')}\n")
-                    f.write(f"   地址: {addr}\n")
-                    f.write(f"   转入次数: {count} 次\n")
-                    f.write(f"   总金额: {total_amount:,.2f} {self.token}\n\n")
+                for contract_data in enriched_top5:
+                    f.write(f"{contract_data['rank']}. {contract_data['name']}\n")
+                    f.write(f"   地址: {contract_data['address']}\n")
+                    if HAS_ADDRESS_QUERIER:
+                        f.write(f"   标签: {contract_data.get('address_label', 'Unknown')}\n")
+                        f.write(f"   类型: {contract_data.get('address_type', 'unknown')}\n")
+                        f.write(f"   标签来源: {contract_data.get('label_source', 'unknown')}\n")
+                    f.write(f"   转入次数: {contract_data['transaction_count']} 次\n")
+                    f.write(f"   总金额: {contract_data['total_amount']:,.2f} {self.token}\n\n")
+            
+            # 关闭地址查询器
+            if address_querier:
+                try:
+                    address_querier.close()
+                except:
+                    pass
             
             logger.info(f"💾 结果已保存:")
             logger.info(f"   📄 详细数据: {json_filepath}")
@@ -1122,12 +1178,52 @@ class TokenDepositAnalyzer:
                 logger.info(f"   {hour:02d}:00-{hour:02d}:59: {count} 笔")
     
     def save_filtered_results(self, all_transfers, sorted_contracts, stats, output_dir="temp"):
-        """保存筛选后的结果到文件"""
+        """保存筛选后的结果到文件，包含地址标签查询"""
         try:
             os.makedirs(output_dir, exist_ok=True)
             
+            # 初始化地址标签查询器
+            address_querier = None
+            if HAS_ADDRESS_QUERIER:
+                try:
+                    address_querier = SQLiteAddressLabelQuerier('address_labels.db')
+                    logger.info("🏷️ 地址标签查询器已启用")
+                except Exception as e:
+                    logger.warning(f"⚠️ 地址标签查询器初始化失败: {e}")
+            
             # 生成文件名 - 包含网络和代币名称
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            
+            # 查询地址标签（为合约地址添加标签）
+            enriched_contracts = []
+            for i, (addr, info) in enumerate(sorted_contracts, 1):
+                enriched_info = info.copy()
+                
+                # 查询地址标签
+                if address_querier:
+                    try:
+                        label_info = address_querier.get_address_label(addr, self.network)
+                        enriched_info.update({
+                            'address_label': label_info.get('label', 'Unknown Address'),
+                            'address_type': label_info.get('type', 'unknown'),
+                            'label_source': label_info.get('source', 'unknown')
+                        })
+                        logger.info(f"📛 {addr[:10]}...{addr[-8:]}: {label_info.get('label', 'Unknown')}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 查询地址标签失败 {addr}: {e}")
+                        enriched_info.update({
+                            'address_label': 'Query Failed',
+                            'address_type': 'unknown',
+                            'label_source': 'error'
+                        })
+                else:
+                    enriched_info.update({
+                        'address_label': info['name'],  # 使用原有名称
+                        'address_type': 'contract' if info['is_contract'] else 'unknown',
+                        'label_source': 'local'
+                    })
+                
+                enriched_contracts.append((addr, enriched_info))
             
             # 保存详细数据
             result = {
@@ -1138,18 +1234,22 @@ class TokenDepositAnalyzer:
                 'token': self.token,
                 'min_amount': stats['min_amount'],
                 'min_interactions': stats['min_interactions'],
+                'address_labels_enabled': HAS_ADDRESS_QUERIER,
                 'statistics': stats,
                 'filtered_contracts': [
                     {
                         'rank': i,
                         'address': addr,
                         'name': info['name'],
+                        'address_label': info.get('address_label', 'Unknown'),
+                        'address_type': info.get('address_type', 'unknown'),
+                        'label_source': info.get('label_source', 'unknown'),
                         'transaction_count': info['transaction_count'],
                         'total_amount': info['total_amount'],
                         'average_amount': info['total_amount'] / info['transaction_count'],
                         'is_contract': info['is_contract']
                     }
-                    for i, (addr, info) in enumerate(sorted_contracts, 1)
+                    for i, (addr, info) in enumerate(enriched_contracts, 1)
                 ],
                 'all_transactions': [
                     {
@@ -1190,16 +1290,28 @@ class TokenDepositAnalyzer:
                 f.write(f"总金额: {stats['total_amount']:,.2f} {self.token}\n")
                 f.write(f"平均金额: {stats['average_amount']:,.2f} {self.token}\n")
                 f.write(f"总合约数: {stats['contract_count']} 个\n")
-                f.write(f"符合条件的合约数: {stats['filtered_contract_count']} 个\n\n")
+                f.write(f"符合条件的合约数: {stats['filtered_contract_count']} 个\n")
+                f.write(f"地址标签功能: {'启用' if HAS_ADDRESS_QUERIER else '禁用'}\n\n")
                 
                 f.write(f"交互数量大于{stats['min_interactions']}的合约 (按交互数量排序):\n")
                 f.write(f"{'-'*70}\n")
-                for i, (addr, info) in enumerate(sorted_contracts, 1):
+                for i, (addr, info) in enumerate(enriched_contracts, 1):
                     f.write(f"{i}. {info['name']}\n")
                     f.write(f"   地址: {addr}\n")
+                    if HAS_ADDRESS_QUERIER:
+                        f.write(f"   标签: {info.get('address_label', 'Unknown')}\n")
+                        f.write(f"   类型: {info.get('address_type', 'unknown')}\n")
+                        f.write(f"   标签来源: {info.get('label_source', 'unknown')}\n")
                     f.write(f"   交互次数: {info['transaction_count']} 次\n")
                     f.write(f"   总金额: {info['total_amount']:,.2f} {self.token}\n")
                     f.write(f"   平均金额: {info['total_amount']/info['transaction_count']:,.2f} {self.token}\n\n")
+            
+            # 关闭地址查询器
+            if address_querier:
+                try:
+                    address_querier.close()
+                except:
+                    pass
             
             logger.info(f"\n💾 结果已保存:")
             logger.info(f"   📄 详细数据: {json_filepath}")

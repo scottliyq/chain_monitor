@@ -672,6 +672,20 @@ class SQLiteAddressLabelQuerier:
         if hasattr(self, 'conn'):
             self.conn.close()
             print("📊 SQLite数据库已关闭")
+    
+    def __enter__(self):
+        """上下文管理器入口"""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """上下文管理器出口"""
+        self.close()
+    
+    @staticmethod
+    def query_single_address(address: str, network: str = 'ethereum', db_file: str = 'address_labels.db') -> Dict[str, str]:
+        """静态方法：查询单个地址标签"""
+        with SQLiteAddressLabelQuerier(db_file) as querier:
+            return querier.get_address_label(address, network)
 
 def main():
     """主函数"""
