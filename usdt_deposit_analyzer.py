@@ -16,6 +16,7 @@ from decimal import Decimal
 from collections import defaultdict, Counter
 from dotenv import load_dotenv
 from block_time_converter import BlockTimeConverter
+from address_constant import KNOWN_CONTRACTS, USDT_CONTRACT_ADDRESS
 
 # 加载环境变量
 load_dotenv()
@@ -32,8 +33,8 @@ class USDTDepositAnalyzer:
         # 初始化区块时间转换器
         self.block_converter = BlockTimeConverter()
         
-        # 合约地址
-        self.USDT_CONTRACT_ADDRESS = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+        # 合约地址（从地址常量文件导入）
+        self.USDT_CONTRACT_ADDRESS = USDT_CONTRACT_ADDRESS
         
         # API配置
         self.etherscan_api_key = os.getenv('ETHERSCAN_API_KEY', 'YourApiKeyToken')
@@ -736,48 +737,6 @@ class USDTDepositAnalyzer:
         destination_counter = Counter()
         contract_info = {}
         
-        # 已知的合约类型映射（用于识别合约类型）
-        known_contracts = {
-            # Uniswap V3 Pools
-            "0x4e68Ccd3E89f51C3074ca5072bbAC773960dFa36": "UniswapV3Pool",
-            "0x11b815efB8f581194ae79006d24E0d814B7697F6": "UniswapV3Pool", 
-            "0xc7bBeC68d12a0d1830360F8Ec58fA599bA1b0e9b": "UniswapV3Pool",
-            "0x33676385160f9d8f03a0db2821029882f7c79e93": "UniswapV3Pool",
-            
-            # Aave V3
-            "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2": "AaveV3Pool",
-            "0x794a61358D6845594F94dc1DB02A252b5b4814aD": "AaveV3Pool",
-            
-            # Compound V3
-            "0xc3d688B66703497DAA19211EEdff47f25384cdc3": "CompoundV3",
-            "0xA17581A9E3356d9A858b789D68B4d866e593aE94": "CompoundV3",
-            
-            # Curve Finance
-            "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7": "Curve3Pool",
-            "0xA5407eAE9Ba41422680e2e00537571bcC53efBfD": "CurvePool",
-            
-            # CEX deposits
-            "0x28C6c06298d514Db089934071355E5743bf21d60": "Binance",
-            "0x21a31Ee1afC51d94C2eFcCAa2092aD1028285549": "Binance",
-            "0xDFd5293D8e347dFe59E90eFd55b2956a1343963d": "Binance",
-            "0x564286362092D8e7936f0549571a803B203aAceD": "Binance",
-            "0x0681d8Db095565FE8A346fA0277bFfdE9C0eDBBF": "Binance",
-            "0xF977814e90dA44bFA03b6295A0616a897441aceC": "Binance",
-            "0x8894E0a0c962CB723c1976a4421c95949bE2D4E3": "Binance",
-            "0x3f5CE5FBFe3E9af3971dD833D26bA9b5C936f0bE": "Binance",
-            
-            # Coinbase
-            "0x71660c4005BA85c37ccec55d0C4493E66Fe775d3": "Coinbase",
-            "0x503828976D22510aad0201ac7EC88293211D23Da": "Coinbase",
-            "0xddfAbCdc4D8FfC6d5beaf154f18B778f892A0740": "Coinbase",
-            "0x3cD751E6b0078Be393132286c442345e5DC49699": "Coinbase",
-            
-            # Other exchanges
-            "0x6Cc5F688a315f3dC28A7781717a9A798a59fDA7b": "OKX",
-            "0x2B5634C42055806a59e9107ED44D43c426E58258": "KuCoin",
-            "0xE853c56864A2ebe4576a807D26Fdc4A0adA51919": "Kraken",
-        }
-        
         for i, transfer in enumerate(transfers, 1):
             if i % 100 == 0 or i == len(transfers):
                 print(f"   处理进度: {i}/{len(transfers)}")
@@ -787,7 +746,7 @@ class USDTDepositAnalyzer:
             
             # 检查是否是已知合约
             if to_address not in contract_info:
-                contract_name = known_contracts.get(to_address, "Unknown")
+                contract_name = KNOWN_CONTRACTS.get(to_address, "Unknown")
                 
                 # 检查是否是合约地址
                 is_contract = self.is_contract_address(to_address)
