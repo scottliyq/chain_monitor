@@ -28,6 +28,7 @@ share/python-wheels/
 MANIFEST
 temp/
 test/
+results/
 monitor_output/
 
 # PyInstaller
