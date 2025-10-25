@@ -16,29 +16,36 @@ from decimal import Decimal
 from collections import defaultdict, Counter
 from dotenv import load_dotenv
 from block_time_converter import BlockTimeConverter
-from address_constant import KNOWN_CONTRACTS, USDT_CONTRACT_ADDRESS
+from address_constant import KNOWN_CONTRACTS, USDT_CONTRACT_ADDRESS, TOKEN_CONTRACTS, get_token_address, get_contract_name
 
 # 加载环境变量
 load_dotenv()
 
 class USDTDepositAnalyzer:
-    def __init__(self, start_time=None, end_time=None, min_amount=None):
+    def __init__(self, start_time=None, end_time=None, min_amount=None, network="ethereum"):
         """初始化USDT Deposit分析器
         
         Args:
             start_time (str): 开始时间，格式如 "2025-10-24 00:00:00"
             end_time (str): 结束时间，格式如 "2025-10-24 23:59:59"
             min_amount (float): 最小转账金额（USDT），默认1000
+            network (str): 区块链网络 ("ethereum", "arbitrum", "base", "bsc")，默认"ethereum"
         """
-        # 初始化区块时间转换器
-        self.block_converter = BlockTimeConverter()
+        # 网络配置
+        self.network = network.lower()
+        self.network_config = self._get_network_config(self.network)
         
-        # 合约地址（从地址常量文件导入）
-        self.USDT_CONTRACT_ADDRESS = USDT_CONTRACT_ADDRESS
+        # 合约地址（根据网络获取USDT地址）
+        self.USDT_CONTRACT_ADDRESS = get_token_address(self.network, "USDT")
+        if not self.USDT_CONTRACT_ADDRESS or self.USDT_CONTRACT_ADDRESS == "0x0000000000000000000000000000000000000000":
+            raise ValueError(f"网络 '{self.network}' 不支持USDT或USDT地址未配置")
         
-        # API配置
+        # API配置（根据网络选择）
+        self.api_config = self._get_api_config(self.network)
+        
+        # 初始化区块时间转换器（传入网络特定的API配置）
+        self.block_converter = BlockTimeConverter(self.api_config)
         self.etherscan_api_key = os.getenv('ETHERSCAN_API_KEY', 'YourApiKeyToken')
-        self.etherscan_api_url = "https://api.etherscan.io/v2/api"  # 使用V2 API
         
         # Web3配置
         self.rpc_url = self._get_rpc_url()
@@ -83,29 +90,123 @@ class USDTDepositAnalyzer:
             self.min_amount = 1000  # 默认1000 USDT
             print(f"💰 使用默认最小金额: {self.min_amount} USDT")
         
-        self.usdt_decimals = 6  # USDT是6位小数
+        self.usdt_decimals = self.network_config["usdt_decimals"]  # 根据网络设置USDT小数位数
         
         print(f"🔧 配置信息:")
+        print(f"   网络: {self.network_config['name']} (Chain ID: {self.network_config['chain_id']})")
         print(f"   USDT合约: {self.USDT_CONTRACT_ADDRESS}")
-        print(f"   Etherscan API: {'***' + self.etherscan_api_key[-4:] if len(self.etherscan_api_key) > 4 else 'YourApiKeyToken'}")
+        print(f"   USDT小数位数: {self.usdt_decimals}")
+        print(f"   API端点: {self.api_config['base_url']}")
+        print(f"   API密钥: {'***' + self.api_config['api_key'][-4:] if len(self.api_config['api_key']) > 4 else 'YourApiKeyToken'}")
         print(f"   RPC URL: {self.rpc_url}")
         print(f"   查询时间范围: {self.start_time_str} 到 {self.end_time_str} UTC")
         print(f"   查询区块范围: {self.start_block:,} 到 {self.end_block:,}")
         print(f"   分析范围: 转账金额 >= {self.min_amount} USDT")
         print()
     
+    def _get_network_config(self, network):
+        """获取网络配置信息"""
+        network_configs = {
+            "ethereum": {
+                "name": "Ethereum Mainnet",
+                "chain_id": 1,
+                "native_token": "ETH",
+                "block_time": 12,  # 秒
+                "usdt_decimals": 6
+            },
+            "arbitrum": {
+                "name": "Arbitrum One",
+                "chain_id": 42161,
+                "native_token": "ETH",
+                "block_time": 0.25,  # 秒
+                "usdt_decimals": 6
+            },
+            "base": {
+                "name": "Base",
+                "chain_id": 8453,
+                "native_token": "ETH",
+                "block_time": 2,  # 秒
+                "usdt_decimals": 6  # Base主要使用USDC，但结构保持一致
+            },
+            "bsc": {
+                "name": "BNB Smart Chain",
+                "chain_id": 56,
+                "native_token": "BNB",
+                "block_time": 3,  # 秒
+                "usdt_decimals": 18  # BSC上的USDT是18位小数
+            }
+        }
+        
+        if network not in network_configs:
+            raise ValueError(f"不支持的网络: {network}. 支持的网络: {list(network_configs.keys())}")
+        
+        return network_configs[network]
+    
+    def _get_api_config(self, network):
+        """获取不同网络的API配置"""
+        api_configs = {
+            "ethereum": {
+                "base_url": "https://api.etherscan.io/v2/api",
+                "api_key_env": "ETHERSCAN_API_KEY",
+                "chain_id": 1
+            },
+            "arbitrum": {
+                "base_url": "https://api.etherscan.io/v2/api",  # 统一使用etherscan的v2端点
+                "api_key_env": "ARBISCAN_API_KEY",  # 可以回退到ETHERSCAN_API_KEY
+                "chain_id": 42161
+            },
+            "base": {
+                "base_url": "https://api.etherscan.io/v2/api",  # 统一使用etherscan的v2端点
+                "api_key_env": "BASESCAN_API_KEY",  # 可以回退到ETHERSCAN_API_KEY
+                "chain_id": 8453
+            },
+            "bsc": {
+                "base_url": "https://api.etherscan.io/v2/api",  # 统一使用etherscan的v2端点
+                "api_key_env": "BSCSCAN_API_KEY",  # 可以回退到ETHERSCAN_API_KEY
+                "chain_id": 56
+            }
+        }
+        
+        config = api_configs[network]
+        
+        # 尝试获取特定网络的API密钥，如果没有则回退到通用密钥
+        api_key = os.getenv(config["api_key_env"]) or os.getenv('ETHERSCAN_API_KEY', 'YourApiKeyToken')
+        
+        return {
+            "base_url": config["base_url"],
+            "api_key": api_key,
+            "chain_id": config["chain_id"]
+        }
+    
     def _get_rpc_url(self):
-        """从环境变量获取RPC URL"""
-        rpc_url = os.getenv('WEB3_RPC_URL')
+        """从环境变量获取RPC URL，支持多网络"""
+        # 根据网络获取对应的环境变量名
+        network_rpc_env = {
+            "ethereum": "WEB3_RPC_URL",
+            "arbitrum": "ARBITRUM_RPC_URL", 
+            "base": "BASE_RPC_URL",
+            "bsc": "BSC_RPC_URL"
+        }
+        
+        # 优先使用网络特定的RPC URL
+        rpc_env_name = network_rpc_env.get(self.network, "WEB3_RPC_URL")
+        rpc_url = os.getenv(rpc_env_name)
+        
+        # 如果没有网络特定的RPC，尝试通用RPC
         if not rpc_url:
-            # 备选方案
-            if os.getenv('WEB3_ALCHEMY_PROJECT_ID'):
-                return f"https://eth-mainnet.g.alchemy.com/v2/{os.getenv('WEB3_ALCHEMY_PROJECT_ID')}"
-            elif os.getenv('WEB3_INFURA_PROJECT_ID'):
-                return f"https://mainnet.infura.io/v3/{os.getenv('WEB3_INFURA_PROJECT_ID')}"
-            else:
-                # 使用免费的公共RPC端点
-                return "https://eth.llamarpc.com"
+            rpc_url = os.getenv('WEB3_RPC_URL')
+        
+        if not rpc_url:
+            # 根据网络提供默认的公共RPC端点
+            default_rpcs = {
+                "ethereum": "https://eth.llamarpc.com",
+                "arbitrum": "https://arb1.arbitrum.io/rpc",
+                "base": "https://mainnet.base.org",
+                "bsc": "https://bsc-dataseed1.binance.org"
+            }
+            
+            rpc_url = default_rpcs.get(self.network, "https://eth.llamarpc.com")
+            print(f"⚠️ 使用默认RPC端点: {rpc_url}")
         
         return rpc_url.strip()
     
@@ -120,10 +221,12 @@ class USDTDepositAnalyzer:
             
             # 验证连接
             chain_id = web3.eth.chain_id
-            if chain_id != 1:
-                print(f"⚠️ 警告: 当前连接的不是以太坊主网 (Chain ID: {chain_id})")
+            expected_chain_id = self.network_config["chain_id"]
+            
+            if chain_id != expected_chain_id:
+                print(f"⚠️ 警告: 连接的链ID ({chain_id}) 与期望的{self.network_config['name']}链ID ({expected_chain_id}) 不匹配")
             else:
-                print(f"✅ 成功连接以太坊主网")
+                print(f"✅ 成功连接{self.network_config['name']} (Chain ID: {chain_id})")
             
             return web3
             
@@ -229,7 +332,7 @@ class USDTDepositAnalyzer:
         """
         try:
             params = {
-                'chainid': 1,  # 以太坊主网
+                'chainid': self.api_config["chain_id"],
                 'module': 'account',
                 'action': 'tokentx',
                 'contractaddress': self.USDT_CONTRACT_ADDRESS,
@@ -238,10 +341,10 @@ class USDTDepositAnalyzer:
                 'page': 1,
                 'offset': 10000,  # 单次查询最大条数
                 'sort': 'desc',
-                'apikey': self.etherscan_api_key
+                'apikey': self.api_config["api_key"]
             }
             
-            response = requests.get(self.etherscan_api_url, params=params, timeout=30)
+            response = requests.get(self.api_config["base_url"], params=params, timeout=30)
             data = response.json()
             
             if data['status'] == '1':
@@ -272,7 +375,7 @@ class USDTDepositAnalyzer:
             end_block = self.end_block
             
             params = {
-                'chainid': 1,  # 以太坊主网 - V2 API新增参数
+                'chainid': self.api_config["chain_id"],
                 'module': 'account',
                 'action': 'tokentx',
                 'contractaddress': self.USDT_CONTRACT_ADDRESS,
@@ -281,10 +384,10 @@ class USDTDepositAnalyzer:
                 'page': page,
                 'offset': per_page,
                 'sort': 'desc',
-                'apikey': self.etherscan_api_key
+                'apikey': self.api_config["api_key"]
             }
             
-            response = requests.get(self.etherscan_api_url, params=params, timeout=30)
+            response = requests.get(self.api_config["base_url"], params=params, timeout=30)
             data = response.json()
             
             print(f"   API响应状态: {data.get('status')}, 消息: {data.get('message')}")
@@ -541,14 +644,14 @@ class USDTDepositAnalyzer:
         """从Etherscan获取合约名称"""
         try:
             params = {
-                'chainid': 1,  # 以太坊主网 - V2 API新增参数
+                'chainid': self.api_config["chain_id"],
                 'module': 'contract',
                 'action': 'getsourcecode',
                 'address': contract_address,
-                'apikey': self.etherscan_api_key
+                'apikey': self.api_config["api_key"]
             }
             
-            response = requests.get(self.etherscan_api_url, params=params, timeout=10)
+            response = requests.get(self.api_config["base_url"], params=params, timeout=10)
             data = response.json()
             
             if data['status'] == '1' and data['result']:
@@ -746,7 +849,7 @@ class USDTDepositAnalyzer:
             
             # 检查是否是已知合约
             if to_address not in contract_info:
-                contract_name = KNOWN_CONTRACTS.get(to_address, "Unknown")
+                contract_name = get_contract_name(self.network, to_address)
                 
                 # 检查是否是合约地址
                 is_contract = self.is_contract_address(to_address)
@@ -995,7 +1098,7 @@ class USDTDepositAnalyzer:
 
 def main():
     """主函数"""
-    print("💰 USDT交易分析工具")
+    print("💰 多链USDT交易分析工具")
     print("=" * 50)
     
     # 检查命令行参数
@@ -1003,10 +1106,17 @@ def main():
         print("📖 功能说明:")
         print("  分析指定UTC时间范围内的USDT转账")
         print("  筛选大于指定金额的交易")
+        print("  支持多个区块链网络")
         print("  列出交互数量大于10的所有合约，按交互数量排序")
         print()
         print("📝 使用方法:")
-        print(f"  python {sys.argv[0]} [start_time_utc] [end_time_utc] [min_amount]")
+        print(f"  python {sys.argv[0]} [start_time_utc] [end_time_utc] [min_amount] [network]")
+        print()
+        print("🌐 支持的网络:")
+        print("  - ethereum (默认) - 以太坊主网")
+        print("  - arbitrum       - Arbitrum One")
+        print("  - base           - Base") 
+        print("  - bsc            - BNB Smart Chain")
         print()
         print("🕐 UTC时间格式:")
         print("  - YYYY-MM-DD HH:MM:SS  (如: 2025-10-24 00:00:00)")
@@ -1019,8 +1129,17 @@ def main():
         print("  - 默认值: 1000 USDT")
         print()
         print("🔧 环境变量配置 (.env文件):")
+        print("  # 通用API密钥")
         print("  ETHERSCAN_API_KEY=YourEtherscanApiKey")
+        print("  # 网络特定API密钥（可选）")
+        print("  ARBISCAN_API_KEY=YourArbiscanApiKey")
+        print("  BASESCAN_API_KEY=YourBasescanApiKey")
+        print("  BSCSCAN_API_KEY=YourBscscanApiKey")
+        print("  # RPC端点（可选）")
         print("  WEB3_RPC_URL=https://eth.llamarpc.com")
+        print("  ARBITRUM_RPC_URL=https://arb1.arbitrum.io/rpc")
+        print("  BASE_RPC_URL=https://mainnet.base.org")
+        print("  BSC_RPC_URL=https://bsc-dataseed1.binance.org")
         print()
         print("📊 分析内容:")
         print("  - 指定UTC时间范围的USDT转账记录")
@@ -1031,9 +1150,12 @@ def main():
         print("  - 保存详细结果到文件")
         print()
         print("📋 示例:")
+        print(f"  # 以太坊主网分析")
         print(f"  python {sys.argv[0]} '2025-10-24 00:00:00' '2025-10-24 23:59:59'")
-        print(f"  python {sys.argv[0]} '2025-10-24' '2025-10-25' 500")
-        print(f"  python {sys.argv[0]} '2024-10-24 00:00:00' '2024-10-24 23:59:59' 10000")
+        print(f"  # Arbitrum网络分析")
+        print(f"  python {sys.argv[0]} '2025-10-24 00:00:00' '2025-10-24 23:59:59' 1000 arbitrum")
+        print(f"  # BSC网络大额交易分析")
+        print(f"  python {sys.argv[0]} '2025-10-24' '2025-10-25' 10000 bsc")
         print("  # 分析2024年10月24日UTC全天，筛选大于10000 USDT的交易")
         return
     
@@ -1042,6 +1164,7 @@ def main():
         start_time = None
         end_time = None
         min_amount = None
+        network = 'ethereum'  # 默认以太坊主网
         
         if len(sys.argv) >= 3:
             start_time = sys.argv[1]
@@ -1058,10 +1181,21 @@ def main():
                 except ValueError:
                     print(f"⚠️ 警告: 无效的最小金额参数 '{sys.argv[3]}'，使用默认值1000 USDT")
                     min_amount = None
+            
+            # 检查是否提供了网络参数
+            if len(sys.argv) >= 5:
+                network = sys.argv[4].lower()
+                if network not in ['ethereum', 'arbitrum', 'base', 'bsc']:
+                    print(f"⚠️ 警告: 不支持的网络 '{sys.argv[4]}'，使用默认以太坊主网")
+                    network = 'ethereum'
+                else:
+                    print(f"   网络: {network}")
+            else:
+                print(f"   网络: {network} (默认)")
         else:
             # 使用默认时间范围或交互式输入
             print("📝 未指定时间参数，将使用默认UTC时间范围 2025-10-24")
-            print("   如需指定UTC时间，请使用: python usdt_deposit_analyzer.py '开始时间UTC' '结束时间UTC' [最小金额]")
+            print("   如需指定UTC时间，请使用: python usdt_deposit_analyzer.py '开始时间UTC' '结束时间UTC' [最小金额] [网络]")
             
             # 可选择交互式输入
             user_input = input("是否要手动输入UTC时间范围？(y/N): ").strip().lower()
@@ -1070,6 +1204,7 @@ def main():
                 start_time = input("开始时间UTC (如 2025-10-24 00:00:00): ").strip()
                 end_time = input("结束时间UTC (如 2025-10-24 23:59:59): ").strip()
                 min_amount_input = input("最小金额USDT (如 1000，留空使用默认值): ").strip()
+                network_input = input("网络 (ethereum/arbitrum/base/bsc，留空默认ethereum): ").strip().lower()
                 
                 if not start_time or not end_time:
                     print("❌ 时间不能为空，使用默认UTC时间范围")
@@ -1082,9 +1217,15 @@ def main():
                     except ValueError:
                         print(f"⚠️ 警告: 无效的最小金额 '{min_amount_input}'，使用默认值")
                         min_amount = None
+                
+                if network_input and network_input in ['ethereum', 'arbitrum', 'base', 'bsc']:
+                    network = network_input
+                    print(f"   选择网络: {network}")
+                else:
+                    print(f"   使用默认网络: {network}")
         
         # 创建分析器实例
-        analyzer = USDTDepositAnalyzer(start_time, end_time, min_amount)
+        analyzer = USDTDepositAnalyzer(start_time, end_time, min_amount, network)
         
         # 执行分析
         analyzer.analyze()
