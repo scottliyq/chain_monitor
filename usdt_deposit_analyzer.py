@@ -235,19 +235,40 @@ class TokenDepositAnalyzer:
             return None
     
     def is_contract_address(self, address):
-        """检查地址是否为合约地址"""
+        """检查地址是否为合约地址
+        
+        Args:
+            address (str): 要检查的地址
+            
+        Returns:
+            tuple: (is_contract: bool, address_type: str)
+        """
         try:
             if self.web3:
                 # 转换为checksum地址
                 checksum_address = self.web3.to_checksum_address(address)
                 code = self.web3.eth.get_code(checksum_address)
-                return len(code) > 2  # 不只是'0x'
+                is_contract = len(code) > 2  # 不只是'0x'
+                address_type = "Contract" if is_contract else "EOA"
+                return is_contract, address_type
             else:
-                # 如果没有Web3连接，假设是合约（保守估计）
-                return True
+                # 如果没有Web3连接，返回Unknown类型
+                return False, "Unknown"
         except Exception as e:
             print(f"   ⚠️ 检查合约地址失败 {address}: {e}")
-            return False
+            return False, "Unknown"
+    
+    def check_address_type(self, address):
+        """检查地址类型的便捷方法（兼容旧接口）
+        
+        Args:
+            address (str): 要检查的地址
+            
+        Returns:
+            bool: 是否为合约地址
+        """
+        is_contract, _ = self.is_contract_address(address)
+        return is_contract
     
     def get_usdt_transfers_by_time_segments(self, segment_minutes=10):
         """分段获取USDT转账记录，避开Etherscan 10000条记录限制
@@ -852,7 +873,7 @@ class TokenDepositAnalyzer:
                 contract_name = get_contract_name(self.network, to_address)
                 
                 # 检查是否是合约地址
-                is_contract = self.is_contract_address(to_address)
+                is_contract = self.check_address_type(to_address)
                 
                 contract_info[to_address] = {
                     'is_contract': is_contract,
