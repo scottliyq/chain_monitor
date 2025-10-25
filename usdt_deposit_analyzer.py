@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-USDT交易分析工具
-分析2024年10月24日UTC全天的USDT转账（大于1000 USDT），
+多链代币交易分析工具
+分析指定时间范围内的代币转账（可配置最小金额），
 列出交互数量大于10的所有合约，按交互数量排序
+支持多个区块链网络和多种代币
 """
 
 import sys
@@ -16,29 +17,31 @@ from decimal import Decimal
 from collections import defaultdict, Counter
 from dotenv import load_dotenv
 from block_time_converter import BlockTimeConverter
-from address_constant import KNOWN_CONTRACTS, USDT_CONTRACT_ADDRESS, TOKEN_CONTRACTS, get_token_address, get_contract_name
+from address_constant import KNOWN_CONTRACTS, USDT_CONTRACT_ADDRESS, TOKEN_CONTRACTS, get_token_address, get_contract_name, get_token_decimals
 
 # 加载环境变量
 load_dotenv()
 
-class USDTDepositAnalyzer:
-    def __init__(self, start_time=None, end_time=None, min_amount=None, network="ethereum"):
-        """初始化USDT Deposit分析器
+class TokenDepositAnalyzer:
+    def __init__(self, start_time=None, end_time=None, min_amount=None, network="ethereum", token="USDT"):
+        """初始化代币交易分析器
         
         Args:
             start_time (str): 开始时间，格式如 "2025-10-24 00:00:00"
             end_time (str): 结束时间，格式如 "2025-10-24 23:59:59"
-            min_amount (float): 最小转账金额（USDT），默认1000
+            min_amount (float): 最小转账金额，默认1000
             network (str): 区块链网络 ("ethereum", "arbitrum", "base", "bsc")，默认"ethereum"
+            token (str): 代币名称 ("USDT", "USDC", "DAI", 等)，默认"USDT"
         """
         # 网络配置
         self.network = network.lower()
+        self.token = token.upper()
         self.network_config = self._get_network_config(self.network)
         
-        # 合约地址（根据网络获取USDT地址）
-        self.USDT_CONTRACT_ADDRESS = get_token_address(self.network, "USDT")
-        if not self.USDT_CONTRACT_ADDRESS or self.USDT_CONTRACT_ADDRESS == "0x0000000000000000000000000000000000000000":
-            raise ValueError(f"网络 '{self.network}' 不支持USDT或USDT地址未配置")
+        # 合约地址（根据网络获取指定代币地址）
+        self.TOKEN_CONTRACT_ADDRESS = get_token_address(self.network, self.token)
+        if not self.TOKEN_CONTRACT_ADDRESS or self.TOKEN_CONTRACT_ADDRESS == "0x0000000000000000000000000000000000000000":
+            raise ValueError(f"网络 '{self.network}' 不支持代币 '{self.token}' 或地址未配置")
         
         # API配置（根据网络选择）
         self.api_config = self._get_api_config(self.network)
@@ -85,23 +88,24 @@ class USDTDepositAnalyzer:
         # 分析配置
         if min_amount is not None:
             self.min_amount = float(min_amount)
-            print(f"💰 使用参数指定的最小金额: {self.min_amount} USDT")
+            print(f"💰 使用参数指定的最小金额: {self.min_amount} {self.token}")
         else:
-            self.min_amount = 1000  # 默认1000 USDT
-            print(f"💰 使用默认最小金额: {self.min_amount} USDT")
+            self.min_amount = 1000  # 默认1000
+            print(f"💰 使用默认最小金额: {self.min_amount} {self.token}")
         
-        self.usdt_decimals = self.network_config["usdt_decimals"]  # 根据网络设置USDT小数位数
+        # 获取代币小数位数
+        self.token_decimals = get_token_decimals(self.network, self.token)
         
         print(f"🔧 配置信息:")
         print(f"   网络: {self.network_config['name']} (Chain ID: {self.network_config['chain_id']})")
-        print(f"   USDT合约: {self.USDT_CONTRACT_ADDRESS}")
-        print(f"   USDT小数位数: {self.usdt_decimals}")
+        print(f"   {self.token}合约: {self.TOKEN_CONTRACT_ADDRESS}")
+        print(f"   {self.token}小数位数: {self.token_decimals}")
         print(f"   API端点: {self.api_config['base_url']}")
         print(f"   API密钥: {'***' + self.api_config['api_key'][-4:] if len(self.api_config['api_key']) > 4 else 'YourApiKeyToken'}")
         print(f"   RPC URL: {self.rpc_url}")
         print(f"   查询时间范围: {self.start_time_str} 到 {self.end_time_str} UTC")
         print(f"   查询区块范围: {self.start_block:,} 到 {self.end_block:,}")
-        print(f"   分析范围: 转账金额 >= {self.min_amount} USDT")
+        print(f"   分析范围: 转账金额 >= {self.min_amount} {self.token}")
         print()
     
     def _get_network_config(self, network):
@@ -112,28 +116,24 @@ class USDTDepositAnalyzer:
                 "chain_id": 1,
                 "native_token": "ETH",
                 "block_time": 12,  # 秒
-                "usdt_decimals": 6
             },
             "arbitrum": {
                 "name": "Arbitrum One",
                 "chain_id": 42161,
                 "native_token": "ETH",
                 "block_time": 0.25,  # 秒
-                "usdt_decimals": 6
             },
             "base": {
                 "name": "Base",
                 "chain_id": 8453,
                 "native_token": "ETH",
                 "block_time": 2,  # 秒
-                "usdt_decimals": 6  # Base主要使用USDC，但结构保持一致
             },
             "bsc": {
                 "name": "BNB Smart Chain",
                 "chain_id": 56,
                 "native_token": "BNB",
                 "block_time": 3,  # 秒
-                "usdt_decimals": 18  # BSC上的USDT是18位小数
             }
         }
         
@@ -258,7 +258,7 @@ class USDTDepositAnalyzer:
         Returns:
             list: 所有转账记录列表
         """
-        print(f"🔄 开始分段查询USDT转账（每段 {segment_minutes} 分钟）")
+        print(f"🔄 开始分段查询{self.token}转账（每段 {segment_minutes} 分钟）")
         
         all_transfers = []
         segment_seconds = segment_minutes * 60
@@ -287,7 +287,7 @@ class USDTDepositAnalyzer:
                 print(f"   📦 区块范围: {start_block:,} - {end_block:,}")
                 
                 # 查询当前时间段的转账
-                segment_transfers = self._get_usdt_transfers_for_blocks(start_block, end_block)
+                segment_transfers = self._get_token_transfers_for_blocks(start_block, end_block)
                 
                 if segment_transfers:
                     # 过滤出确实在目标时间范围内的转账
@@ -320,8 +320,8 @@ class USDTDepositAnalyzer:
         
         return all_transfers
     
-    def _get_usdt_transfers_for_blocks(self, start_block, end_block):
-        """获取指定区块范围内的USDT转账记录
+    def _get_token_transfers_for_blocks(self, start_block, end_block):
+        """获取指定区块范围内的代币转账记录
         
         Args:
             start_block (int): 开始区块号
@@ -335,7 +335,7 @@ class USDTDepositAnalyzer:
                 'chainid': self.api_config["chain_id"],
                 'module': 'account',
                 'action': 'tokentx',
-                'contractaddress': self.USDT_CONTRACT_ADDRESS,
+                'contractaddress': self.TOKEN_CONTRACT_ADDRESS,
                 'startblock': start_block,
                 'endblock': end_block,
                 'page': 1,
@@ -357,8 +357,8 @@ class USDTDepositAnalyzer:
             print(f"   ❌ 查询区块范围转账失败: {e}")
             return []
 
-    def get_usdt_transfers(self, page=1, per_page=5000):
-        """获取USDT转账记录 (旧方法，保留兼容性)
+    def get_token_transfers(self, page=1, per_page=5000):
+        """获取代币转账记录 (旧方法，保留兼容性)
         
         Args:
             page (int): 页码
@@ -368,7 +368,7 @@ class USDTDepositAnalyzer:
             list: 转账记录列表
         """
         try:
-            print(f"🔍 获取USDT转账记录 (页码: {page})")
+            print(f"🔍 获取{self.token}转账记录 (页码: {page})")
             
             # 使用动态获取的区块范围
             start_block = self.start_block
@@ -378,7 +378,7 @@ class USDTDepositAnalyzer:
                 'chainid': self.api_config["chain_id"],
                 'module': 'account',
                 'action': 'tokentx',
-                'contractaddress': self.USDT_CONTRACT_ADDRESS,
+                'contractaddress': self.TOKEN_CONTRACT_ADDRESS,
                 'startblock': start_block,
                 'endblock': end_block,
                 'page': page,
@@ -441,7 +441,7 @@ class USDTDepositAnalyzer:
         for transfer in transfers:
             try:
                 # USDT是6位小数
-                amount = Decimal(transfer['value']) / Decimal(10 ** self.usdt_decimals)
+                amount = Decimal(transfer['value']) / Decimal(10 ** self.token_decimals)
                 transfer['amount_usdt'] = float(amount)
                 
                 # 筛选大于1000 USDT的转账
@@ -450,7 +450,7 @@ class USDTDepositAnalyzer:
             except:
                 continue
         
-        print(f"💰 大于{self.min_amount} USDT的转账: {len(large_transfers)} 笔")
+        print(f"💰 大于{self.min_amount} {self.token}的转账: {len(large_transfers)} 笔")
         return large_transfers
     
     def get_transaction_details(self, tx_hash):
@@ -878,13 +878,13 @@ class USDTDepositAnalyzer:
     def analyze(self):
         """执行完整分析"""
         try:
-            print(f"🚀 开始分析USDT交易...")
-            print(f"⏰ 查询{self.start_time_str} 到 {self.end_time_str} UTC的USDT转账")
-            print(f"📊 筛选大于{self.min_amount} USDT的转账")
+            print(f"🚀 开始分析{self.token}交易...")
+            print(f"⏰ 查询{self.start_time_str} 到 {self.end_time_str} UTC的{self.token}转账")
+            print(f"📊 筛选大于{self.min_amount} {self.token}的转账")
             print(f"🎯 列出交互数量大于10的所有合约，按交互数量排序")
             print("=" * 60)
             
-            # 使用分段查询获取USDT转账记录
+            # 使用分段查询获取代币转账记录
             print(f"🔄 使用分段查询方式获取转账记录...")
             all_transfers = self.get_usdt_transfers_by_time_segments(segment_minutes=10)
             
@@ -892,13 +892,13 @@ class USDTDepositAnalyzer:
                 print("❌ 未找到任何转账记录")
                 return
             
-            print(f"📦 获取到总计 {len(all_transfers)} 笔USDT转账")
+            print(f"📦 获取到总计 {len(all_transfers)} 笔{self.token}转账")
             
             # 处理大于指定金额的转账
             processed_transfers = self.filter_large_amounts(all_transfers)
             
             if not processed_transfers:
-                print(f"❌ 未发现大于{self.min_amount} USDT的转账数据")
+                print(f"❌ 未发现大于{self.min_amount} {self.token}的转账数据")
                 return
             
             # 分析所有转账，统计合约交互
@@ -947,7 +947,7 @@ class USDTDepositAnalyzer:
     
     def format_filtered_results(self, all_transfers, sorted_contracts, stats):
         """格式化并显示筛选后的交易分析结果"""
-        print(f"\n📊 USDT交易分析结果")
+        print(f"\n📊 {self.token}交易分析结果")
         print("=" * 80)
         print(f"⏰ 分析时间范围: {stats['query_date']} UTC 全天")
         print(f"💰 最小金额: {stats['min_amount']:,} USDT")
@@ -1098,7 +1098,7 @@ class USDTDepositAnalyzer:
 
 def main():
     """主函数"""
-    print("💰 多链USDT交易分析工具")
+    print("💰 多链代币交易分析工具")
     print("=" * 50)
     
     # 检查命令行参数
@@ -1165,6 +1165,7 @@ def main():
         end_time = None
         min_amount = None
         network = 'ethereum'  # 默认以太坊主网
+        token = 'USDT'  # 默认USDT
         
         if len(sys.argv) >= 3:
             start_time = sys.argv[1]
@@ -1175,6 +1176,26 @@ def main():
             
             # 检查是否提供了最小金额参数
             if len(sys.argv) >= 4:
+                try:
+                    min_amount = float(sys.argv[3])
+                    print(f"   最小金额: {min_amount}")
+                except ValueError:
+                    print(f"⚠️ 警告: 无效的最小金额参数 '{sys.argv[3]}'，使用默认值1000")
+                    min_amount = None
+            
+            # 检查是否提供了网络参数
+            if len(sys.argv) >= 5:
+                network = sys.argv[4].lower()
+                if network in ['ethereum', 'arbitrum', 'base', 'bsc']:
+                    print(f"   网络: {network}")
+                else:
+                    print(f"⚠️ 警告: 不支持的网络 '{network}'，使用默认网络 ethereum")
+                    network = 'ethereum'
+            
+            # 检查是否提供了代币参数
+            if len(sys.argv) >= 6:
+                token = sys.argv[5].upper()
+                print(f"   代币: {token}")
                 try:
                     min_amount = float(sys.argv[3])
                     print(f"   最小金额: {min_amount} USDT")
@@ -1225,7 +1246,7 @@ def main():
                     print(f"   使用默认网络: {network}")
         
         # 创建分析器实例
-        analyzer = USDTDepositAnalyzer(start_time, end_time, min_amount, network)
+        analyzer = TokenDepositAnalyzer(start_time, end_time, min_amount, network, token)
         
         # 执行分析
         analyzer.analyze()

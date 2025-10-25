@@ -42,6 +42,47 @@ TOKEN_CONTRACTS = {
     }
 }
 
+# 代币小数位数配置（按网络分类）
+TOKEN_DECIMALS = {
+    # Ethereum Mainnet (Chain ID: 1)
+    "ethereum": {
+        "USDT": 6,
+        "USDC": 6,
+        "DAI": 18,
+        "WETH": 18,
+    },
+    
+    # Arbitrum One (Chain ID: 42161)
+    "arbitrum": {
+        "USDT": 6,
+        "USDC": 6,
+        "USDC.e": 6,
+        "DAI": 18,
+        "WETH": 18,
+        "ARB": 18,
+    },
+    
+    # Base (Chain ID: 8453)
+    "base": {
+        "USDT": 6,  # Base没有原生USDT，但保持一致性
+        "USDC": 6,
+        "USDbC": 6,
+        "DAI": 18,
+        "WETH": 18,
+        "CBETH": 18,
+    },
+    
+    # BSC (Chain ID: 56)
+    "bsc": {
+        "USDT": 18,  # BSC上的USDT是18位小数
+        "USDC": 18,  # BSC上的USDC是18位小数
+        "BUSD": 18,
+        "DAI": 18,
+        "WBNB": 18,
+        "BNB": 18,
+    }
+}
+
 # 快速访问主网代币（保持向后兼容）
 USDT_CONTRACT_ADDRESS = TOKEN_CONTRACTS["ethereum"]["USDT"]
 USDC_CONTRACT_ADDRESS = TOKEN_CONTRACTS["ethereum"]["USDC"]
@@ -130,6 +171,20 @@ def get_contracts_by_type(chain: str, contract_type: str) -> list:
     """
     chain_contracts = KNOWN_CONTRACTS.get(chain, {})
     return [address for address, ctype in chain_contracts.items() if ctype == contract_type]
+
+def get_token_decimals(chain: str, token: str) -> int:
+    """
+    获取指定链上代币的小数位数
+    
+    Args:
+        chain (str): 链名称 ("ethereum", "arbitrum", "base", "bsc")
+        token (str): 代币符号 ("USDT", "USDC", "DAI", 等)
+        
+    Returns:
+        int: 代币小数位数，如果未找到返回默认值6
+    """
+    chain_decimals = TOKEN_DECIMALS.get(chain, {})
+    return chain_decimals.get(token, 6)  # 默认返回6位小数
 
 # 已知的合约类型映射（按网络分类，用于识别合约类型）
 KNOWN_CONTRACTS = {
