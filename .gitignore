@@ -29,6 +29,7 @@ MANIFEST
 temp/
 test/
 results/
+logs/
 monitor_output/
 
 # PyInstaller
