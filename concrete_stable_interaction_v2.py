@@ -12,6 +12,8 @@ from decimal import Decimal
 import json
 import time
 import requests
+import glob
+from typing import Optional
 from dotenv import load_dotenv
 from eth_account import Account
 
@@ -19,11 +21,12 @@ from eth_account import Account
 load_dotenv()
 
 class ConcreteStableInteractionV2:
-    def __init__(self, mock_mode=False):
+    def __init__(self, mock_mode=False, preprod_mode=False):
         """初始化合约交互器
         
         Args:
             mock_mode (bool): 是否使用mock模式（Impersonate）
+            preprod_mode (bool): 是否使用preprod模式（本地RPC + 真实签名）
         """
         # 合约地址
         self.CONCRETE_STABLE_ADDRESS = Web3.to_checksum_address("0x6503de9fe77d256d9d823f2d335ce83ece9e153f")
@@ -31,6 +34,11 @@ class ConcreteStableInteractionV2:
         
         # 模式设置
         self.mock_mode = mock_mode
+        self.preprod_mode = preprod_mode
+        
+        # 确保不会同时启用两种模式
+        if mock_mode and preprod_mode:
+            raise ValueError("❌ 不能同时启用mock模式和preprod模式")
         
         # Etherscan API配置
         self.etherscan_api_key = os.getenv('ETHERSCAN_API_KEY', 'YourApiKeyToken')
@@ -42,6 +50,11 @@ class ConcreteStableInteractionV2:
             self.private_key = None
             self.account = None
             print(f"🎭 Mock模式 - 使用Impersonate")
+        elif preprod_mode:
+            self.private_key = self._get_private_key()
+            self.account = Account.from_key(self.private_key)
+            self.wallet_address = self.account.address
+            print(f"🧪 Preprod模式 - 真实签名 + 本地RPC")
         else:
             self.private_key = self._get_private_key()
             self.account = Account.from_key(self.private_key)
@@ -103,13 +116,14 @@ class ConcreteStableInteractionV2:
     
     def _get_rpc_url(self):
         """从环境变量获取RPC URL"""
-        # Mock模式下优先使用 MOCK_WEB3_RPC_URL
-        if self.mock_mode:
+        # Mock模式和Preprod模式都优先使用 MOCK_WEB3_RPC_URL
+        if self.mock_mode or self.preprod_mode:
             mock_rpc_url = os.getenv('MOCK_WEB3_RPC_URL')
             if mock_rpc_url:
                 return mock_rpc_url.strip()
             else:
-                print("⚠️ Mock模式下未找到MOCK_WEB3_RPC_URL，使用默认的本地节点")
+                mode_name = "Mock模式" if self.mock_mode else "Preprod模式"
+                print(f"⚠️ {mode_name}下未找到MOCK_WEB3_RPC_URL，使用默认的本地节点")
                 return "http://127.0.0.1:8545"
         
         # 真实模式下使用 WEB3_RPC_URL
@@ -429,23 +443,78 @@ class ConcreteStableInteractionV2:
         
         return usdt_fallback_abi, concrete_fallback_abi
     
+    def _load_abi_from_local(self, contract_address: str, contract_name: str = None) -> Optional[list]:
+        """从本地ABI目录加载合约ABI"""
+        abi_dir = os.path.join(os.path.dirname(__file__), 'abi')
+        
+        if not os.path.exists(abi_dir):
+            return None
+        
+        # 生成可能的文件名模式
+        address_lower = contract_address.lower()
+        patterns = []
+        
+        if contract_name:
+            # 如果提供了合约名称，优先查找包含合约名称的文件
+            patterns.append(f"*_{contract_name}_{address_lower}.json")
+            patterns.append(f"*_{contract_name}_*.json")
+        
+        # 查找包含地址的文件
+        patterns.append(f"*_{address_lower}.json")
+        patterns.append(f"*{address_lower}*.json")
+        
+        for pattern in patterns:
+            files = glob.glob(os.path.join(abi_dir, pattern))
+            for file_path in files:
+                try:
+                    print(f"🔍 尝试从本地加载ABI: {os.path.basename(file_path)}")
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    
+                    # 验证文件格式
+                    if isinstance(data, dict) and 'abi' in data:
+                        stored_address = data.get('contract_address', '').lower()
+                        if stored_address == address_lower:
+                            print(f"✅ 成功从本地加载ABI: {os.path.basename(file_path)}")
+                            print(f"   包含 {len(data['abi'])} 个ABI项目")
+                            return data['abi']
+                    elif isinstance(data, list):
+                        # 直接是ABI数组格式
+                        print(f"✅ 成功从本地加载ABI: {os.path.basename(file_path)}")
+                        print(f"   包含 {len(data)} 个ABI项目")
+                        return data
+                except Exception as e:
+                    print(f"⚠️ 读取本地ABI文件失败 {os.path.basename(file_path)}: {e}")
+                    continue
+        
+        return None
+    
     def _get_contract_abis(self):
-        """获取所有合约的ABI（支持重试机制）"""
-        print(f"🔄 开始从Etherscan v2 API获取合约ABI...")
+        """获取所有合约的ABI（优先本地，然后支持重试机制）"""
+        print(f"🔄 开始获取合约ABI...")
         
         # 获取备用ABI
         usdt_fallback, concrete_fallback = self._get_fallback_abis()
         
-        # 获取USDT ABI（支持重试）
+        # 获取USDT ABI
         print(f"\n📋 正在获取USDT合约ABI...")
-        self.usdt_abi = self._get_contract_abi_with_retry(self.USDT_CONTRACT_ADDRESS, "USDT")
+        # 先尝试从本地加载
+        self.usdt_abi = self._load_abi_from_local(self.USDT_CONTRACT_ADDRESS, "USDT")
+        if not self.usdt_abi:
+            print(f"🌐 本地未找到USDT ABI，从Etherscan v2 API获取...")
+            self.usdt_abi = self._get_contract_abi_with_retry(self.USDT_CONTRACT_ADDRESS, "USDT")
         if not self.usdt_abi:
             print(f"📋 使用USDT备用ABI (完整ERC20标准)")
             self.usdt_abi = usdt_fallback
         
-        # 获取Concrete_STABLE ABI（支持重试）
+        # 获取Concrete_STABLE ABI
         print(f"\n📋 正在获取Concrete_STABLE合约ABI...")
-        concrete_abi = self._get_contract_abi_with_retry(self.CONCRETE_STABLE_ADDRESS, "Concrete_STABLE")
+        # 先尝试从本地加载
+        concrete_abi = self._load_abi_from_local(self.CONCRETE_STABLE_ADDRESS, "Concrete_STABLE")
+        if not concrete_abi:
+            print(f"🌐 本地未找到Concrete_STABLE ABI，从Etherscan v2 API获取...")
+            concrete_abi = self._get_contract_abi_with_retry(self.CONCRETE_STABLE_ADDRESS, "Concrete_STABLE")
+        
         if not concrete_abi:
             print(f"📋 使用Concrete_STABLE备用ABI (包含ERC4626标准函数)")
             self.concrete_abi = concrete_fallback
@@ -961,17 +1030,31 @@ class ConcreteStableInteractionV2:
         """显示当前配置信息"""
         print(f"🔧 当前配置信息")
         print(f"{'='*50}")
-        print(f"🎯 运行模式: {'🎭 Mock模式 (Impersonate)' if self.mock_mode else '🔐 真实签名模式'}")
+        
+        if self.mock_mode:
+            mode_desc = '🎭 Mock模式 (Impersonate)'
+        elif self.preprod_mode:
+            mode_desc = '🧪 Preprod模式 (真实签名 + 本地RPC)'
+        else:
+            mode_desc = '🔐 真实签名模式'
+            
+        print(f"🎯 运行模式: {mode_desc}")
         print(f"🌐 RPC URL: {self.rpc_url}")
         print(f"🔗 网络ID: {self.network_id}")
         print(f"📍 钱包地址: {self.wallet_address}")
         print(f"🏦 Concrete_STABLE: {self.CONCRETE_STABLE_ADDRESS}")
         print(f"💰 USDT合约: {self.USDT_CONTRACT_ADDRESS}")
+        
         if self.mock_mode:
             print(f"💡 Mock配置说明:")
             print(f"   - 使用环境变量: MOCK_WEB3_RPC_URL")
             print(f"   - Impersonate地址: MOCK_WALLET_ADDRESS")
             print(f"   - 无需私钥，本地分叉网络模拟交易")
+        elif self.preprod_mode:
+            print(f"💡 Preprod配置说明:")
+            print(f"   - 使用环境变量: MOCK_WEB3_RPC_URL (本地RPC)")
+            print(f"   - 需要私钥: WALLET_PRIVATE_KEY (真实签名)")
+            print(f"   - 本地分叉网络，真实签名但无实际成本")
         else:
             print(f"💡 真实模式说明:")
             print(f"   - 使用环境变量: WEB3_RPC_URL")
@@ -987,7 +1070,7 @@ def main():
     # 检查命令行参数
     if len(sys.argv) < 2:
         print("📖 使用方法:")
-        print(f"  python {sys.argv[0]} <操作> [参数] [--mock]")
+        print(f"  python {sys.argv[0]} <操作> [参数] [--mock|--preprod]")
         print()
         print("📝 支持的操作:")
         print(f"  balance              - 查询余额")
@@ -998,33 +1081,50 @@ def main():
         print()
         print("🎭 模式选项:")
         print(f"  --mock              - 使用Mock模式（Impersonate，适用于本地分叉）")
+        print(f"  --preprod           - 使用Preprod模式（真实签名 + 本地RPC）")
         print(f"  (默认)             - 使用真实签名模式")
         print()
         print("📝 示例:")
         print(f"  python {sys.argv[0]} balance --mock")
-        print(f"  python {sys.argv[0]} approve --mock")
-        print(f"  python {sys.argv[0]} deposit 100 --mock")
+        print(f"  python {sys.argv[0]} approve --preprod")
+        print(f"  python {sys.argv[0]} deposit 100 --preprod")
         print(f"  python {sys.argv[0]} all 100 --mock")
         print()
         print("🔧 环境变量配置 (.env文件):")
         print("  # Mock模式 (本地分叉)")
         print("  MOCK_WALLET_ADDRESS=0xF977814e90dA44bFA03b6295A0616a897441aceC")
-        print("  WEB3_RPC_URL=http://127.0.0.1:8545")
-        print("  WEB3_NETWORK_ID=31337")
-        print("  ETHERSCAN_API_KEY=YourApiKeyToken")
+        print("  MOCK_WEB3_RPC_URL=http://127.0.0.1:8545")
+        print()
+        print("  # Preprod模式 (真实签名 + 本地RPC)")
+        print("  WALLET_PRIVATE_KEY=0x...")
+        print("  MOCK_WEB3_RPC_URL=http://127.0.0.1:8545")
+        print()
+        print("  # 真实模式 (真实签名 + 真实网络)")
+        print("  WALLET_PRIVATE_KEY=0x...")
+        print("  WEB3_RPC_URL=https://eth.llamarpc.com")
+        print("  ETHERSCAN_API_KEY=YourApiKey")
         return
     
     # 解析参数
     args = sys.argv[1:]
     mock_mode = '--mock' in args
+    preprod_mode = '--preprod' in args
+    
+    # 验证模式参数
+    if mock_mode and preprod_mode:
+        print("❌ 错误: 不能同时使用 --mock 和 --preprod 参数")
+        return
+    
     if mock_mode:
         args.remove('--mock')
+    if preprod_mode:
+        args.remove('--preprod')
     
     operation = args[0].lower() if args else 'balance'
     
     try:
         # 创建交互器实例
-        interactor = ConcreteStableInteractionV2(mock_mode=mock_mode)
+        interactor = ConcreteStableInteractionV2(mock_mode=mock_mode, preprod_mode=preprod_mode)
         
         if operation == "balance":
             # 查询余额
