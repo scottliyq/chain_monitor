@@ -86,13 +86,21 @@ class HistoricalTokenBalanceChecker:
         self.target_time_str = target_time
         self.token = token.upper()
         self.network = network.lower()
-        self.address_to_check = Web3.to_checksum_address(address_to_check)
+        
+        # 设置检查地址（单地址模式才需要）
+        if address_to_check:
+            self.address_to_check = Web3.to_checksum_address(address_to_check)
+        else:
+            self.address_to_check = None
         
         self.logger.info(f"🚀 初始化历史代币余额查询器")
         self.logger.info(f"   目标时间: {self.target_time_str} UTC")
         self.logger.info(f"   代币: {self.token}")
         self.logger.info(f"   网络: {self.network}")
-        self.logger.info(f"   查询地址: {self.address_to_check}")
+        if self.address_to_check:
+            self.logger.info(f"   查询地址: {self.address_to_check}")
+        else:
+            self.logger.info("   查询模式: 批量查询")
         
         # 获取网络配置
         self.network_config = self._get_network_config(self.network)
@@ -239,7 +247,7 @@ class HistoricalTokenBalanceChecker:
             target_timestamp = self.block_converter.datetime_to_timestamp(self.target_time_str)
             target_block = self.block_converter.get_block_by_timestamp(target_timestamp)
             
-            self.logger.info(f"📦 目标时间 {self.target_time_str} UTC 对应的区块号: {target_block:,}")
+            self.logger.info(f"📦 目标时间 {self.target_time_str} UTC 对应的区块号: {target_block}")
             return target_block
             
         except Exception as e:
@@ -293,59 +301,282 @@ class HistoricalTokenBalanceChecker:
             self.logger.error(f"❌ 查询代币余额失败: {e}")
             raise
     
-    def save_result(self, result):
-        """保存查询结果到文件"""
-        # 生成文件名
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename_base = f"{self.network}_{self.token}_balance_{timestamp}"
-        
-        # 创建结果目录
-        results_dir = "results"
-        os.makedirs(results_dir, exist_ok=True)
-        
-        # 保存JSON格式
-        json_file = os.path.join(results_dir, f"{filename_base}.json")
-        with open(json_file, 'w', encoding='utf-8') as f:
-            json.dump(result, f, indent=2, ensure_ascii=False)
-        
-        # 保存可读格式
-        txt_file = os.path.join(results_dir, f"{filename_base}.txt")
-        with open(txt_file, 'w', encoding='utf-8') as f:
-            f.write(f"历史代币余额查询结果\n")
-            f.write(f"=" * 50 + "\n\n")
-            f.write(f"查询时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
-            f.write(f"目标时间: {result['target_time']} UTC\n")
-            f.write(f"网络: {self.network_config['name']}\n")
-            f.write(f"代币: {result['token']}\n")
-            f.write(f"代币合约: {result['token_contract']}\n")
-            f.write(f"查询地址: {result['address']}\n")
-            f.write(f"目标区块号: {result['block_number']:,}\n")
-            f.write(f"代币小数位数: {result['token_decimals']}\n")
-            f.write(f"\n余额信息:\n")
-            f.write(f"  原始余额: {result['balance_wei']} wei\n")
-            f.write(f"  格式化余额: {result['balance_tokens']} {result['token']}\n")
-        
-        self.logger.info(f"📁 结果已保存:")
-        self.logger.info(f"   JSON文件: {json_file}")
-        self.logger.info(f"   文本文件: {txt_file}")
-        
-        return json_file, txt_file
+    def get_token_balance_for_address(self, address, block_number):
+        """查询指定地址在指定区块的代币余额"""
+        try:
+            # ERC20 balanceOf 函数签名
+            balance_of_signature = "0x70a08231"  # balanceOf(address)
+            
+            # 构造调用数据
+            padded_address = address[2:].zfill(64)  # 移除0x并填充到64位
+            call_data = balance_of_signature + padded_address
+            
+            # 构造调用
+            call_params = {
+                "to": self.TOKEN_CONTRACT_ADDRESS,
+                "data": call_data
+            }
+            
+            # 在指定区块高度调用
+            result = self.web3.eth.call(call_params, block_identifier=block_number)
+            
+            # 解析结果
+            balance_wei = int(result.hex(), 16)
+            balance_tokens = Decimal(balance_wei) / Decimal(10 ** self.token_decimals)
+            
+            return {
+                "address": address,
+                "balance_wei": balance_wei,
+                "balance_tokens": balance_tokens
+            }
+            
+        except Exception as e:
+            self.logger.debug(f"查询地址 {address} 余额失败: {e}")
+            return {
+                "address": address,
+                "balance_wei": 0,
+                "balance_tokens": Decimal(0)
+            }
     
-    def run(self):
-        """执行完整的历史余额查询流程"""
+    def get_token_holders_from_events(self, from_block=0, to_block=None):
+        """通过分析Transfer事件获取所有代币持有人地址"""
+        self.logger.info(f"📊 正在分析 {self.token} 合约的Transfer事件以获取持有人列表...")
+        
+        if to_block is None:
+            to_block = 'latest'
+        
+        try:
+            # ERC20 Transfer 事件签名: Transfer(address indexed from, address indexed to, uint256 value)
+            transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+            
+            # 分批查询事件，避免API限制
+            chunk_size = 10000  # 每次查询的区块范围
+            all_holders = set()
+            
+            current_from = from_block
+            while current_from <= to_block if isinstance(to_block, int) else True:
+                current_to = min(current_from + chunk_size - 1, to_block) if isinstance(to_block, int) else current_from + chunk_size - 1
+                
+                self.logger.info(f"   查询区块范围: {current_from:,} - {current_to:,}")
+                
+                try:
+                    # 查询Transfer事件
+                    logs = self.web3.eth.get_logs({
+                        'fromBlock': current_from,
+                        'toBlock': current_to,
+                        'address': self.TOKEN_CONTRACT_ADDRESS,
+                        'topics': [transfer_topic]
+                    })
+                    
+                    # 解析事件获取地址
+                    for log in logs:
+                        if len(log['topics']) >= 3:
+                            # from地址（可能为0x0，表示铸币）
+                            from_addr = "0x" + log['topics'][1].hex()[-40:]
+                            # to地址
+                            to_addr = "0x" + log['topics'][2].hex()[-40:]
+                            
+                            # 添加非零地址到持有人集合
+                            if from_addr != "0x0000000000000000000000000000000000000000":
+                                all_holders.add(Web3.to_checksum_address(from_addr))
+                            if to_addr != "0x0000000000000000000000000000000000000000":
+                                all_holders.add(Web3.to_checksum_address(to_addr))
+                    
+                    self.logger.info(f"   发现 {len(logs)} 个Transfer事件，当前总持有人数: {len(all_holders)}")
+                    
+                except Exception as e:
+                    self.logger.warning(f"   查询区块 {current_from}-{current_to} 失败: {e}")
+                
+                current_from = current_to + 1
+                
+                # 如果是查询到latest，需要获取当前最新区块号来判断是否结束
+                if not isinstance(to_block, int):
+                    try:
+                        latest_block = self.web3.eth.block_number
+                        if current_from > latest_block:
+                            break
+                    except:
+                        break
+            
+            self.logger.info(f"✅ 事件分析完成，总共发现 {len(all_holders)} 个唯一持有人地址")
+            return list(all_holders)
+            
+        except Exception as e:
+            self.logger.error(f"❌ 获取代币持有人列表失败: {e}")
+            raise
+    
+    def find_addresses_with_balance_above(self, min_balance_tokens, max_addresses=1000):
+        """
+        查询指定时间的代币余额大于指定数量的所有地址
+        
+        Args:
+            min_balance_tokens (float): 最小余额阈值（以代币为单位）
+            max_addresses (int): 最大返回地址数量，避免过多结果
+            
+        Returns:
+            list: 包含地址和余额信息的列表
+        """
+        self.logger.info(f"🔍 查询 {self.target_time_str} 时 {self.token} 余额 > {min_balance_tokens:,.6f} 的所有地址")
+        
         try:
             # 1. 获取目标区块号
             target_block = self.get_target_block_number()
             
-            # 2. 查询代币余额
-            result = self.get_token_balance_at_block(target_block)
+            # 2. 获取所有代币持有人
+            self.logger.info(f"📊 获取 {self.token} 合约的所有持有人...")
+            all_holders = self.get_token_holders_from_events(to_block=target_block)
             
-            # 3. 保存结果
-            json_file, txt_file = self.save_result(result)
+            if not all_holders:
+                self.logger.warning("⚠️ 未找到任何代币持有人")
+                return []
             
-            self.logger.info(f"🎉 历史代币余额查询完成!")
-            return result
+            self.logger.info(f"📋 开始检查 {len(all_holders)} 个持有人在区块 {target_block:,} 的余额...")
             
+            # 3. 批量查询余额并过滤
+            qualified_addresses = []
+            min_balance_wei = Decimal(min_balance_tokens) * Decimal(10 ** self.token_decimals)
+            
+            for i, address in enumerate(all_holders, 1):
+                if i % 100 == 0:
+                    self.logger.info(f"   进度: {i}/{len(all_holders)} ({i/len(all_holders)*100:.1f}%)")
+                
+                balance_info = self.get_token_balance_for_address(address, target_block)
+                
+                if balance_info['balance_wei'] >= min_balance_wei:
+                    qualified_addresses.append({
+                        "address": address,
+                        "balance_tokens": float(balance_info['balance_tokens']),
+                        "balance_wei": str(balance_info['balance_wei']),
+                        "block_number": target_block,
+                        "target_time": self.target_time_str,
+                        "token": self.token,
+                        "network": self.network,
+                        "token_contract": self.TOKEN_CONTRACT_ADDRESS
+                    })
+                    
+                    self.logger.debug(f"   ✅ {address}: {balance_info['balance_tokens']:,.6f} {self.token}")
+                    
+                    # 限制结果数量
+                    if len(qualified_addresses) >= max_addresses:
+                        self.logger.info(f"   🛑 达到最大地址数量限制: {max_addresses}")
+                        break
+            
+            # 按余额降序排序
+            qualified_addresses.sort(key=lambda x: x['balance_tokens'], reverse=True)
+            
+            self.logger.info(f"✅ 查询完成:")
+            self.logger.info(f"   检查地址数: {min(len(all_holders), max_addresses)}")
+            self.logger.info(f"   符合条件地址数: {len(qualified_addresses)}")
+            self.logger.info(f"   最小余额要求: {min_balance_tokens:,.6f} {self.token}")
+            
+            if qualified_addresses:
+                self.logger.info(f"   余额最高地址: {qualified_addresses[0]['address']} ({qualified_addresses[0]['balance_tokens']:,.6f} {self.token})")
+                self.logger.info(f"   余额最低地址: {qualified_addresses[-1]['address']} ({qualified_addresses[-1]['balance_tokens']:,.6f} {self.token})")
+            
+            return qualified_addresses
+            
+        except Exception as e:
+            self.logger.error(f"❌ 查询余额大于阈值的地址失败: {e}")
+            raise
+    
+    def save_result(self, result):
+        """保存查询结果到JSON文件"""
+        try:
+            # 创建results目录
+            results_dir = 'results'
+            os.makedirs(results_dir, exist_ok=True)
+            
+            # 生成文件名
+            if isinstance(result, list):
+                # 批量查询结果
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"token_holders_above_threshold_{self.network}_{self.token}_{timestamp}.json"
+                
+                # 添加汇总信息
+                summary = {
+                    "query_info": {
+                        "target_time": self.target_time_str,
+                        "token": self.token,
+                        "network": self.network,
+                        "total_qualified_addresses": len(result),
+                        "query_timestamp": datetime.now().isoformat(),
+                        "min_balance_required": result[0].get('min_balance_required') if result else None
+                    },
+                    "results": result
+                }
+                result_to_save = summary
+            else:
+                # 单地址查询结果
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                address_short = result['address'][:10] if result.get('address') else 'unknown'
+                filename = f"balance_check_{self.network}_{self.token}_{address_short}_{timestamp}.json"
+                result_to_save = result
+            
+            file_path = os.path.join(results_dir, filename)
+            
+            # 保存到JSON文件
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(result_to_save, f, indent=2, ensure_ascii=False, default=str)
+            
+            self.logger.info(f"� 结果已保存到: {file_path}")
+            
+            return file_path
+            
+        except Exception as e:
+            self.logger.error(f"❌ 保存结果失败: {e}")
+            raise
+    
+    def run(self, mode='single', min_balance=None, max_addresses=1000):
+        """
+        执行余额查询
+        
+        Args:
+            mode (str): 查询模式 - 'single' 单地址查询, 'batch' 批量查询大户
+            min_balance (float): 批量查询时的最小余额阈值
+            max_addresses (int): 批量查询时的最大返回地址数
+        """
+        try:
+            if mode == 'single':
+                if not self.address_to_check:
+                    raise ValueError("单地址查询模式需要提供查询地址")
+                
+                self.logger.info(f"🚀 开始单地址余额查询...")
+                
+                # 获取目标区块号
+                target_block = self.get_target_block_number()
+                
+                # 查询余额
+                result = self.get_token_balance_at_block(target_block)
+                
+                # 保存结果
+                self.save_result(result)
+                
+                return result
+                
+            elif mode == 'batch':
+                if min_balance is None:
+                    raise ValueError("批量查询模式需要提供最小余额阈值")
+                
+                self.logger.info(f"🚀 开始批量查询余额大户...")
+                
+                # 查询余额大于阈值的地址
+                results = self.find_addresses_with_balance_above(min_balance, max_addresses)
+                
+                # 保存结果
+                if results:
+                    # 添加查询参数到结果中
+                    for result in results:
+                        result['min_balance_required'] = min_balance
+                    
+                    self.save_result(results)
+                else:
+                    self.logger.info("📭 未找到符合条件的地址")
+                
+                return results
+                
+            else:
+                raise ValueError(f"不支持的查询模式: {mode}. 支持的模式: 'single', 'batch'")
+                
         except Exception as e:
             self.logger.error(f"❌ 历史代币余额查询失败: {e}")
             raise
@@ -356,9 +587,19 @@ def main():
     parser.add_argument('--time', required=True, help='目标时间 (格式: "YYYY-MM-DD HH:MM:SS")')
     parser.add_argument('--token', required=True, help='代币名称 (如: USDT, USDC, LINK)')
     parser.add_argument('--network', required=True, help='网络名称 (如: ethereum, arbitrum, base, bsc)')
-    parser.add_argument('--address', required=True, help='要查询余额的地址')
+    parser.add_argument('--mode', choices=['single', 'batch'], default='single', 
+                       help='查询模式: single=单地址查询, batch=批量查询大户')
+    parser.add_argument('--address', help='要查询余额的地址 (single模式必需)')
+    parser.add_argument('--min-balance', type=float, help='最小余额阈值 (batch模式必需)')
+    parser.add_argument('--max-addresses', type=int, default=1000, help='最大返回地址数 (batch模式，默认1000)')
     
     args = parser.parse_args()
+    
+    # 验证参数
+    if args.mode == 'single' and not args.address:
+        parser.error("single模式需要提供 --address 参数")
+    if args.mode == 'batch' and args.min_balance is None:
+        parser.error("batch模式需要提供 --min-balance 参数")
     
     # 设置日志
     logger = setup_logging()
@@ -368,7 +609,12 @@ def main():
         logger.info(f"   目标时间: {args.time}")
         logger.info(f"   代币: {args.token}")
         logger.info(f"   网络: {args.network}")
-        logger.info(f"   查询地址: {args.address}")
+        logger.info(f"   查询模式: {args.mode}")
+        if args.mode == 'single':
+            logger.info(f"   查询地址: {args.address}")
+        else:
+            logger.info(f"   最小余额: {args.min_balance}")
+            logger.info(f"   最大地址数: {args.max_addresses}")
         logger.info("")
         
         # 创建查询器并执行
@@ -379,7 +625,11 @@ def main():
             address_to_check=args.address
         )
         
-        result = checker.run()
+        result = checker.run(
+            mode=args.mode,
+            min_balance=args.min_balance,
+            max_addresses=args.max_addresses
+        )
         
         logger.info(f"✅ 程序执行完成")
         
