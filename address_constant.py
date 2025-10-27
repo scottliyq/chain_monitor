@@ -252,7 +252,7 @@ DEFI_PROTOCOLS = {
         # GMX相关协议
         '0x489ee077994B6658eAfA855C308275EAd8097C4A': 'GMX Vault',
         '0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a': 'GMX Router',
-        
+        '0x2df1c51e09aecf9cacb7bc98cb1742757f163df7': 'Hyperliquid Deposit bridge2',
         # Radiant Capital
         '0xF4B1486DD74D07706052A33d31d7c0AAFD0659E1': 'Radiant V2 Pool',
         
