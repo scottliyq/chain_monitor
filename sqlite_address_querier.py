@@ -4,6 +4,12 @@
 查询顺序：本地常量 -> SQLite缓存 -> Moralis API -> Etherscan API -> 更新SQLite
 支持多网络地址查询，Unknown结果不保存
 优先使用Moralis API，失败时回退到Etherscan API
+
+地址类型过滤功能：
+- 只对合约地址进行外部API查询和数据库保存
+- EOA地址直接返回本地结果，不进行API查询，不保存到数据库
+- 如果提供了is_contract_checker函数，将自动检查地址类型
+- 未知类型的地址会跳过数据库保存操作
 """
 
 import json
@@ -100,9 +106,17 @@ class SQLiteAddressLabelQuerier:
                     query_count INTEGER DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_eoa BOOLEAN DEFAULT 0,
                     UNIQUE(address, network)
                 )
             ''')
+            
+            # 检查并添加is_eoa字段（如果不存在）
+            try:
+                self.conn.execute('ALTER TABLE address_labels ADD COLUMN is_eoa BOOLEAN DEFAULT 0')
+            except sqlite3.OperationalError:
+                # 字段已存在，忽略错误
+                pass
             
             # 创建索引以提高查询性能
             self.conn.execute('''
@@ -190,9 +204,26 @@ class SQLiteAddressLabelQuerier:
         
         return None
     
-    def save_to_sqlite(self, address: str, network: str, label_info: Dict):
-        """保存或更新SQLite中的地址标签"""
+    def save_to_sqlite(self, address: str, network: str, label_info: Dict, is_contract: bool = None):
+        """保存或更新SQLite中的地址标签 - 只保存合约地址
+        
+        Args:
+            address: 地址
+            network: 网络名称
+            label_info: 标签信息
+            is_contract: 是否为合约地址，如果为None则跳过保存
+        """
         try:
+            # 如果明确知道不是合约地址，跳过保存
+            if is_contract is False:
+                print(f"   ⏩ 跳过EOA地址保存: {address[:10]}...{address[-8:]}")
+                return
+            
+            # 如果不确定地址类型且没有Web3检查功能，也跳过保存
+            if is_contract is None:
+                print(f"   ❓ 地址类型未知，跳过保存: {address[:10]}...{address[-8:]}")
+                return
+            
             address = address.lower()
             current_time = datetime.now().isoformat()
             
@@ -213,6 +244,7 @@ class SQLiteAddressLabelQuerier:
                         source = ?,
                         contract_name = ?,
                         is_verified = ?,
+                        is_eoa = ?,
                         query_count = query_count + 1,
                         updated_at = ?
                     WHERE address = ? AND network = ?
@@ -222,17 +254,18 @@ class SQLiteAddressLabelQuerier:
                     label_info.get('source', 'unknown'),
                     label_info.get('contract_name'),
                     label_info.get('is_verified', False),
+                    label_info.get('is_eoa', False),
                     current_time,
                     address,
                     network
                 ))
-                print(f"   🔄 SQLite已更新: {label_info.get('label')}")
+                print(f"   🔄 SQLite已更新合约: {label_info.get('label')}")
             else:
                 # 插入新记录
                 self.conn.execute('''
                     INSERT INTO address_labels 
-                    (address, network, label, type, source, contract_name, is_verified, query_count, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (address, network, label, type, source, contract_name, is_verified, is_eoa, query_count, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     address,
                     network,
@@ -241,11 +274,12 @@ class SQLiteAddressLabelQuerier:
                     label_info.get('source', 'unknown'),
                     label_info.get('contract_name'),
                     label_info.get('is_verified', False),
+                    label_info.get('is_eoa', False),
                     1,
                     current_time,
                     current_time
                 ))
-                print(f"   ➕ SQLite已保存: {label_info.get('label')}")
+                print(f"   ➕ SQLite已保存合约: {label_info.get('label')}")
             
             self.conn.commit()
             self.query_stats['sqlite_updates'] += 1
@@ -339,20 +373,36 @@ class SQLiteAddressLabelQuerier:
             print(f"⚠️ {network} API查询失败 {address[:10]}...{address[-8:]}: {e}")
             return None
     
-    def get_address_label(self, address: str, network: str = 'ethereum') -> Dict[str, str]:
-        """获取地址标签 - 多级查询策略"""
+    def get_address_label(self, address: str, network: str = 'ethereum', is_contract_checker=None) -> Dict[str, str]:
+        """获取地址标签 - 多级查询策略
+        
+        Args:
+            address: 地址
+            network: 网络名称
+            is_contract_checker: 合约地址检查函数，返回(is_contract: bool, address_type: str)
+        """
         address = address.lower()
         network = network.lower()
         self.query_stats['total_queries'] += 1
         
         print(f"🔍 查询地址: {address[:10]}...{address[-8:]} ({network})")
         
+        # 检查地址类型
+        is_contract = None
+        if is_contract_checker:
+            try:
+                is_contract, address_type = is_contract_checker(address)
+                print(f"   📝 地址类型: {address_type} ({'合约' if is_contract else 'EOA'})")
+            except Exception as e:
+                print(f"   ⚠️ 地址类型检查失败: {e}")
+                is_contract = None
+        
         # 1. 首先检查地址常量
         constants_result = self.get_from_constants(address, network)
         if constants_result:
             print(f"   ✅ 常量库命中: {constants_result['label']}")
-            # 常量库结果保存到SQLite
-            self.save_to_sqlite(address, network, constants_result)
+            # 常量库结果保存到SQLite（只保存合约地址）
+            self.save_to_sqlite(address, network, constants_result, is_contract)
             return constants_result
         
         # 2. 检查SQLite缓存（如果是Unknown则跳过）
@@ -360,25 +410,37 @@ class SQLiteAddressLabelQuerier:
         if cache_result:
             return cache_result
         
-        # 3. 查询外部API - 优先使用Moralis API
+        # 3. 如果是EOA地址，直接返回默认结果，不进行外部API查询
+        if is_contract is False:
+            print(f"   📝 EOA地址，跳过外部API查询")
+            default_result = {
+                'label': 'EOA Address',
+                'type': 'eoa',
+                'source': 'local_check',
+                'network': network
+            }
+            # EOA地址不保存到数据库
+            return default_result
+        
+        # 4. 查询外部API - 优先使用Moralis API（只对可能的合约地址）
         print(f"   🌐 查询Moralis API...")
         moralis_result = self.query_moralis_api(address, network)
         if moralis_result:
             print(f"   🎯 Moralis API查询成功: {moralis_result['label']}")
-            # 保存API结果到SQLite
-            self.save_to_sqlite(address, network, moralis_result)
+            # 保存API结果到SQLite（只保存合约地址）
+            self.save_to_sqlite(address, network, moralis_result, is_contract)
             return moralis_result
         
-        # 4. 如果Moralis API失败，回退到Etherscan API
+        # 5. 如果Moralis API失败，回退到Etherscan API
         print(f"   🔄 回退到Etherscan API...")
         etherscan_result = self.query_etherscan_api(address, network)
         if etherscan_result:
             print(f"   🎯 Etherscan API查询成功: {etherscan_result['label']}")
-            # 保存API结果到SQLite
-            self.save_to_sqlite(address, network, etherscan_result)
+            # 保存API结果到SQLite（只保存合约地址）
+            self.save_to_sqlite(address, network, etherscan_result, is_contract)
             return etherscan_result
         
-        # 5. 默认返回Unknown - 也保存到SQLite
+        # 6. 默认返回Unknown
         default_result = {
             'label': 'Unknown Address',
             'type': 'unknown',
@@ -386,9 +448,13 @@ class SQLiteAddressLabelQuerier:
             'network': network
         }
         
-        # Unknown地址也保存到SQLite，但下次会重新查询API
-        self.save_to_sqlite(address, network, default_result)
-        print(f"   ❓ 未知地址 (已缓存)")
+        # 只有确认是合约地址才保存Unknown结果到SQLite
+        if is_contract is True:
+            self.save_to_sqlite(address, network, default_result, is_contract)
+            print(f"   ❓ 未知合约地址 (已缓存)")
+        else:
+            print(f"   ❓ 未知地址 (未缓存)")
+        
         return default_result
     
     def extract_addresses_from_txt(self, txt_file: str) -> List[Dict]:

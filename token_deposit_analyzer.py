@@ -328,6 +328,7 @@ class TokenDepositAnalyzer:
     
     def get_usdt_transfers_by_time_segments(self, segment_minutes=10):
         """分段获取USDT转账记录，避开Etherscan 10000条记录限制
+        每次分段查询后立即按金额筛选和排序，最后合并结果
         
         Args:
             segment_minutes (int): 每段查询的时间长度（分钟）
@@ -336,11 +337,14 @@ class TokenDepositAnalyzer:
             list: 所有转账记录列表
         """
         logger.info(f"🔄 开始分段查询{self.token}转账（每段 {segment_minutes} 分钟）")
+        logger.info(f"💰 将立即筛选 >= {self.min_amount} {self.token} 的转账")
         
-        all_transfers = []
+        all_large_transfers = []  # 存储所有大额转账
         segment_seconds = segment_minutes * 60
         current_start = self.start_time
         segment_count = 0
+        total_raw_transfers = 0
+        total_large_transfers = 0
         
         while current_start < self.current_time:
             segment_count += 1
@@ -374,8 +378,26 @@ class TokenDepositAnalyzer:
                         if current_start <= tx_timestamp <= current_end:
                             filtered_transfers.append(transfer)
                     
+                    total_raw_transfers += len(filtered_transfers)
                     logger.info(f"   ✅ 获取到 {len(segment_transfers)} 笔转账，筛选后 {len(filtered_transfers)} 笔在目标时间内")
-                    all_transfers.extend(filtered_transfers)
+                    
+                    # 立即进行金额筛选
+                    if filtered_transfers:
+                        segment_large_transfers = self._filter_large_amounts_segment(filtered_transfers)
+                        if segment_large_transfers:
+                            # 按金额降序排序本段的大额转账
+                            segment_large_transfers.sort(key=lambda x: x['amount_usdt'], reverse=True)
+                            logger.info(f"   💰 本段大额转账: {len(segment_large_transfers)} 笔")
+                            logger.info(f"      💵 最大金额: {segment_large_transfers[0]['amount_usdt']:,.2f} {self.token}")
+                            if len(segment_large_transfers) > 1:
+                                logger.info(f"      💵 最小金额: {segment_large_transfers[-1]['amount_usdt']:,.2f} {self.token}")
+                            
+                            # 合并到总结果中
+                            all_large_transfers.extend(segment_large_transfers)
+                            total_large_transfers += len(segment_large_transfers)
+                        else:
+                            logger.info(f"   📝 本段无大额转账")
+                    
                 else:
                     logger.info(f"   📝 此时间段无转账记录")
                 
@@ -390,12 +412,42 @@ class TokenDepositAnalyzer:
         
         logger.info(f"🎯 分段查询完成！")
         logger.info(f"   📊 总段数: {segment_count}")
-        logger.info(f"   📦 总转账数: {len(all_transfers)}")
+        logger.info(f"   📦 原始转账总数: {total_raw_transfers:,} 笔")
+        logger.info(f"   💰 大额转账总数: {total_large_transfers:,} 笔")
+        logger.info(f"   📈 大额转账占比: {(total_large_transfers/total_raw_transfers*100) if total_raw_transfers > 0 else 0:.2f}%")
         
-        # 按时间戳降序排序
-        all_transfers.sort(key=lambda x: int(x['timeStamp']), reverse=True)
+        # 最终按时间戳降序排序所有大额转账
+        if all_large_transfers:
+            all_large_transfers.sort(key=lambda x: int(x['timeStamp']), reverse=True)
+            logger.info(f"   🕐 时间范围: {datetime.fromtimestamp(int(all_large_transfers[-1]['timeStamp']), tz=timezone.utc).strftime('%H:%M:%S')} - {datetime.fromtimestamp(int(all_large_transfers[0]['timeStamp']), tz=timezone.utc).strftime('%H:%M:%S')} UTC")
         
-        return all_transfers
+        return all_large_transfers
+    
+    def _filter_large_amounts_segment(self, transfers):
+        """筛选单个段的大额转账
+        
+        Args:
+            transfers (list): 单个时间段的转账记录
+            
+        Returns:
+            list: 筛选后的大额转账记录
+        """
+        large_transfers = []
+        
+        for transfer in transfers:
+            try:
+                # 计算代币金额（根据小数位数）
+                amount = Decimal(transfer['value']) / Decimal(10 ** self.token_decimals)
+                transfer['amount_usdt'] = float(amount)
+                
+                # 筛选大于最小金额的转账
+                if amount >= self.min_amount:
+                    large_transfers.append(transfer)
+            except Exception as e:
+                logger.error(f"   ⚠️ 处理转账金额失败: {e}")
+                continue
+        
+        return large_transfers
     
     def _get_token_transfers_for_blocks(self, start_block, end_block):
         """获取指定区块范围内的代币转账记录
@@ -847,7 +899,7 @@ class TokenDepositAnalyzer:
                 # 查询地址标签
                 if address_querier:
                     try:
-                        label_info = address_querier.get_address_label(addr, self.network)
+                        label_info = address_querier.get_address_label(addr, self.network, is_contract_checker=self.is_contract_address)
                         contract_data.update({
                             'address_label': label_info.get('label', 'Unknown Address'),
                             'address_type': label_info.get('type', 'unknown'),
@@ -1001,12 +1053,12 @@ class TokenDepositAnalyzer:
             logger.info(f"🎯 列出交互数量大于10的所有合约，按交互数量排序")
             logger.info("=" * 60)
             
-            # 使用分段查询获取代币转账记录
-            logger.info(f"🔄 使用分段查询方式获取转账记录...")
-            all_transfers = self.get_usdt_transfers_by_time_segments(segment_minutes=10)
+            # 使用优化的分段查询获取已筛选的大额转账记录
+            logger.info(f"🔄 使用优化分段查询方式获取大额转账记录...")
+            processed_transfers = self.get_usdt_transfers_by_time_segments(segment_minutes=10)
             
-            if not all_transfers:
-                logger.error("❌ 未找到任何转账记录")
+            if not processed_transfers:
+                logger.error("❌ 未找到任何大额转账记录")
                 # 即使没有数据也要生成结果文件
                 query_date = datetime.fromtimestamp(self.start_time, tz=timezone.utc).strftime('%Y-%m-%d')
                 empty_stats = {
@@ -1024,28 +1076,32 @@ class TokenDepositAnalyzer:
                 logger.info(f"\n✅ 分析完成! (无数据)")
                 return
             
-            logger.info(f"📦 获取到总计 {len(all_transfers)} 笔{self.token}转账")
+            logger.info(f"� 获取到总计 {len(processed_transfers)} 笔大额{self.token}转账")
+            logger.info(f"   💵 总金额: {sum(t['amount_usdt'] for t in processed_transfers):,.2f} {self.token}")
+            logger.info(f"   📈 平均金额: {sum(t['amount_usdt'] for t in processed_transfers) / len(processed_transfers):,.2f} {self.token}")
+            logger.info(f"   🔝 最大金额: {max(t['amount_usdt'] for t in processed_transfers):,.2f} {self.token}")
+            logger.info(f"   🔻 最小金额: {min(t['amount_usdt'] for t in processed_transfers):,.2f} {self.token}")
             
-            # 处理大于指定金额的转账
-            processed_transfers = self.filter_large_amounts(all_transfers)
+            # 分析所有转账，统计合约交互（已经是筛选后的大额转账）
+            contract_destinations, destination_counter = self.analyze_all_transfers(processed_transfers)
             
-            if not processed_transfers:
-                logger.error(f"❌ 未发现大于{self.min_amount} {self.token}的转账数据")
-                # 即使没有符合条件的转账也要生成结果文件
+            if not contract_destinations:
+                logger.error(f"❌ 未发现转入合约地址的转账")
+                # 即使没有合约地址转账也要生成结果文件
                 query_date = datetime.fromtimestamp(self.start_time, tz=timezone.utc).strftime('%Y-%m-%d')
-                empty_stats = {
-                    'total_amount': 0,
-                    'total_transactions': 0,
+                stats = {
+                    'total_amount': sum(transfer['amount_usdt'] for transfer in processed_transfers),
+                    'total_transactions': len(processed_transfers),
                     'contract_count': 0,
                     'filtered_contract_count': 0,
-                    'average_amount': 0,
+                    'average_amount': sum(transfer['amount_usdt'] for transfer in processed_transfers) / len(processed_transfers) if processed_transfers else 0,
                     'query_date': query_date,
                     'min_amount': self.min_amount,
                     'min_interactions': 10
                 }
-                self.format_filtered_results([], [], empty_stats)
-                self.save_filtered_results([], [], empty_stats)
-                logger.info(f"\n✅ 分析完成! (无符合条件的交易)")
+                self.format_filtered_results(processed_transfers, [], stats)
+                self.save_filtered_results(processed_transfers, [], stats)
+                logger.info(f"\n✅ 分析完成! (无合约地址转账)")
                 return
             
             # 分析所有转账，统计合约交互
@@ -1202,7 +1258,7 @@ class TokenDepositAnalyzer:
                 # 查询地址标签
                 if address_querier:
                     try:
-                        label_info = address_querier.get_address_label(addr, self.network)
+                        label_info = address_querier.get_address_label(addr, self.network, is_contract_checker=self.is_contract_address)
                         enriched_info.update({
                             'address_label': label_info.get('label', 'Unknown Address'),
                             'address_type': label_info.get('type', 'unknown'),
