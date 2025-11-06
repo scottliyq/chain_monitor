@@ -106,18 +106,89 @@ class ABIFetcher:
             print(f"⚠️ 未找到ETHERSCAN_API_KEY，使用默认API密钥")
         return api_key
     
-    def fetch_contract_abi(self, network: str, contract_address: str, max_retries: int = 3) -> Optional[list]:
-        """获取合约ABI"""
+    def get_implementation_address(self, network: str, proxy_address: str) -> Optional[str]:
+        """获取代理合约的实现合约地址"""
+        network_config = self.get_network_config(network)
+        if not network_config:
+            return None
+        
+        api_key = self.get_api_key(network_config)
+        
+        try:
+            # 使用Etherscan API获取合约源代码信息
+            params = {
+                'chainid': network_config['chain_id'],
+                'module': 'contract',
+                'action': 'getsourcecode',
+                'address': proxy_address,
+                'apikey': api_key
+            }
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+            }
+            
+            response = requests.get(
+                network_config['api_url'],
+                params=params,
+                headers=headers,
+                timeout=15
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == '1' and data.get('result'):
+                    result = data['result'][0]
+                    
+                    # 检查是否是代理合约
+                    implementation = result.get('Implementation', '')
+                    proxy_info = result.get('Proxy', '0')
+                    
+                    if implementation and implementation != '':
+                        print(f"🔍 检测到代理合约!")
+                        print(f"   代理地址: {proxy_address}")
+                        print(f"   实现地址: {implementation}")
+                        return implementation
+                    elif proxy_info == '1':
+                        print(f"⚠️ 检测到代理合约但未找到实现地址")
+                        return None
+                        
+        except Exception as e:
+            print(f"⚠️ 检查代理合约时出错: {e}")
+        
+        return None
+    
+    def fetch_contract_abi(self, network: str, contract_address: str, max_retries: int = 3, check_proxy: bool = True) -> Optional[list]:
+        """获取合约ABI
+        
+        Args:
+            network: 网络名称
+            contract_address: 合约地址
+            max_retries: 最大重试次数
+            check_proxy: 是否检查代理合约并获取实现合约的ABI
+        """
         network_config = self.get_network_config(network)
         if not network_config:
             print(f"❌ 不支持的网络: {network}")
             print(f"支持的网络: {', '.join(self.network_configs.keys())}")
             return None
         
+        # 检查是否是代理合约
+        original_address = contract_address
+        if check_proxy:
+            implementation_address = self.get_implementation_address(network, contract_address)
+            if implementation_address:
+                print(f"🔄 将获取实现合约的ABI: {implementation_address}")
+                contract_address = implementation_address
+            else:
+                print(f"✅ 不是代理合约或直接使用当前地址")
+        
         api_key = self.get_api_key(network_config)
         
         print(f"🔍 正在从 {network_config['name']} 获取合约ABI...")
         print(f"📍 合约地址: {contract_address}")
+        if original_address != contract_address:
+            print(f"📍 原始地址: {original_address} (代理)")
         print(f"🌐 API URL: {network_config['api_url']}")
         
         for attempt in range(max_retries):
@@ -189,13 +260,25 @@ class ABIFetcher:
         print(f"❌ 经过{max_retries}次尝试后仍无法获取ABI")
         return None
     
-    def save_abi_to_file(self, abi: list, network: str, contract_address: str, contract_name: str = None) -> str:
-        """保存ABI到文件"""
+    def save_abi_to_file(self, abi: list, network: str, contract_address: str, contract_name: Optional[str] = None, 
+                         proxy_address: Optional[str] = None) -> str:
+        """保存ABI到文件
+        
+        Args:
+            abi: 合约ABI
+            network: 网络名称
+            contract_address: 实现合约地址
+            contract_name: 合约名称（可选）
+            proxy_address: 代理合约地址（如果是代理合约）
+        """
         # 生成文件名 - 保留完整合约地址
+        # 如果是代理合约，使用代理地址作为文件名，但标注为实现合约的ABI
+        display_address = proxy_address if proxy_address else contract_address
+        
         if contract_name:
-            filename = f"{network}_{contract_name}_{contract_address}.json"
+            filename = f"{network}_{contract_name}_{display_address}.json"
         else:
-            filename = f"{network}_{contract_address}.json"
+            filename = f"{network}_{display_address}.json"
         
         filepath = os.path.join(self.abi_dir, filename)
         
@@ -208,6 +291,15 @@ class ABIFetcher:
             'abi_length': len(abi),
             'abi': abi
         }
+        
+        # 如果是代理合约，添加代理信息
+        if proxy_address:
+            save_data['is_proxy'] = True
+            save_data['proxy_address'] = proxy_address
+            save_data['implementation_address'] = contract_address
+            print(f"📝 标记为代理合约:")
+            print(f"   代理地址: {proxy_address}")
+            print(f"   实现地址: {contract_address}")
         
         # 保存到文件
         with open(filepath, 'w', encoding='utf-8') as f:
@@ -339,6 +431,7 @@ def main():
     parser.add_argument('--name', '-n', help='合约名称（用于文件命名）')
     parser.add_argument('--list', '-l', action='store_true', help='列出已保存的ABI文件')
     parser.add_argument('--analyze', '-a', action='store_true', help='分析ABI内容')
+    parser.add_argument('--no-proxy-check', action='store_true', help='不检查代理合约，直接获取当前地址的ABI')
     
     args = parser.parse_args()
     
@@ -355,16 +448,36 @@ def main():
         parser.print_help()
         return
     
-    # 获取ABI
-    abi = fetcher.fetch_contract_abi(args.network, args.address)
+    # 先检查是否是代理合约（除非用户指定不检查）
+    original_address = args.address
+    implementation_address = None
+    
+    if not args.no_proxy_check:
+        implementation_address = fetcher.get_implementation_address(args.network, original_address)
+    else:
+        print(f"⚠️ 跳过代理合约检查，直接获取当前地址的ABI")
+    
+    # 获取ABI (check_proxy参数控制是否在fetch时检查代理)
+    abi = fetcher.fetch_contract_abi(args.network, args.address, check_proxy=not args.no_proxy_check)
     
     if abi:
         # 分析ABI（如果指定了analyze参数）
         if args.analyze:
             fetcher.analyze_abi(abi)
         
-        # 保存ABI
-        filepath = fetcher.save_abi_to_file(abi, args.network, args.address, args.name)
+        # 保存ABI - 如果是代理合约，传递代理地址信息
+        if implementation_address:
+            # 使用实现合约地址获取ABI，但文件名使用代理地址
+            filepath = fetcher.save_abi_to_file(
+                abi, 
+                args.network, 
+                implementation_address,  # 实现合约地址
+                args.name, 
+                proxy_address=original_address  # 代理地址
+            )
+        else:
+            # 普通合约
+            filepath = fetcher.save_abi_to_file(abi, args.network, original_address, args.name)
         
         print(f"\n✅ 操作完成!")
         print(f"📄 ABI文件: {filepath}")
