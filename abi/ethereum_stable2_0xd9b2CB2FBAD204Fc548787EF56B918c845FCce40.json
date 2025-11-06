@@ -2,7 +2,7 @@
   "network": "ethereum",
   "contract_address": "0xd9b2CB2FBAD204Fc548787EF56B918c845FCce40",
   "contract_name": "stable2",
-  "fetched_at": "2025-11-06T13:52:04.602033",
+  "fetched_at": "2025-11-06T20:31:23.420930",
   "abi_length": 120,
   "abi": [
     {
