@@ -9,6 +9,7 @@ Lista MEV合约定期Withdraw脚本
 import os
 import json
 import time
+import math
 import argparse
 from typing import Optional
 from datetime import datetime
@@ -400,38 +401,67 @@ def run_withdraw_cycle(lista: ListaWithdraw, withdraw_amount: float, enable_soun
         logger.info(f"💎 最大可取出金额: {max_withdraw:.6f}")
         logger.info(f"⚙️ 配置取出金额: {withdraw_amount:.6f}")
         
+        # 计算最大可取金额的20%
+        twenty_percent_of_max = max_withdraw * 0.2
+        
         # 检查是否满足取出条件
+        # 情况1: 剩余可取金额 < 配置金额 -> 取出int(剩余金额)，但最小为1
         if max_withdraw < withdraw_amount:
-            logger.warning(f"⚠️ 最大可取出金额 ({max_withdraw:.6f}) 小于配置金额 ({withdraw_amount:.6f})")
-            logger.warning(f"⏭️ 跳过本次取出，等待下次检查")
-            return False
+            # 使用int向下取整
+            int_amount = int(max_withdraw)
+            
+            # 如果取整后小于1，则跳过不取
+            if int_amount < 1:
+                logger.warning(f"⚠️ 最大可取出金额 ({max_withdraw:.6f}) 小于配置金额 ({withdraw_amount:.6f})")
+                logger.warning(f"   int({max_withdraw:.6f}) = {int_amount} < 1，不满足最小取出金额要求")
+                logger.warning(f"⏭️ 跳过本次取出，等待下次检查")
+                return False
+            
+            actual_amount = int_amount
+            logger.info(f"📌 最大可取金额 ({max_withdraw:.6f}) 小于配置金额 ({withdraw_amount:.6f})")
+            logger.info(f"   按规则取出: int({max_withdraw:.6f}) = {actual_amount}")
+            
+            if enable_sound and AUDIO_AVAILABLE:
+                try:
+                    logger.info(f"🔔 播放提示音...")
+                    play_alert_sound()
+                except Exception as e:
+                    logger.warning(f"⚠️ 播放提示音失败: {e}")
+            elif not enable_sound:
+                logger.info(f"🔇 音频提示已关闭")
         
-        # 🔔 满足条件：可取出金额大于配置金额，播放提示音
-        logger.info(f"🎉 检测到可取出金额 ({max_withdraw:.6f}) >= 配置金额 ({withdraw_amount:.6f})")
-        
-        if enable_sound and AUDIO_AVAILABLE:
-            try:
-                logger.info(f"🔔 播放提示音...")
-                play_alert_sound()
-            except Exception as e:
-                logger.warning(f"⚠️ 播放提示音失败: {e}")
-        elif not enable_sound:
-            logger.info(f"🔇 音频提示已关闭")
-        
-        # 计算实际取出金额
-        # 规则：使用配置金额，但不超过最大可取出金额
-        # 如果配置金额超过最大可取出，则使用最大可取出金额
-        if withdraw_amount > max_withdraw:
-            actual_amount = max_withdraw
-            logger.info(f"⚠️ 配置金额 ({withdraw_amount:.6f}) 超过最大可取出 ({max_withdraw:.6f})")
-            logger.info(f"   将使用最大可取出金额")
+        # 情况2: 剩余可取金额 >= 配置金额 -> 取 max(最大可取金额的20%, 配置金额)
         else:
-            actual_amount = withdraw_amount
-        
-        logger.info(f"📊 取出金额计算:")
-        logger.info(f"   最大可取出: {max_withdraw:.6f}")
-        logger.info(f"   配置取出金额: {withdraw_amount:.6f}")
-        logger.info(f"   实际取出金额: {actual_amount:.6f}")
+            logger.info(f"🎉 检测到可取出金额 ({max_withdraw:.6f}) >= 配置金额 ({withdraw_amount:.6f})")
+            
+            if enable_sound and AUDIO_AVAILABLE:
+                try:
+                    logger.info(f"🔔 播放提示音...")
+                    play_alert_sound()
+                except Exception as e:
+                    logger.warning(f"⚠️ 播放提示音失败: {e}")
+            elif not enable_sound:
+                logger.info(f"🔇 音频提示已关闭")
+            
+            # 计算实际取出金额
+            # 规则：取 max(最大可取金额的20%, 配置金额)，但不超过最大可取出金额
+            # 取20%和配置金额的最大值
+            desired_amount = max(twenty_percent_of_max, withdraw_amount)
+            
+            # 确保不超过最大可取出金额
+            if desired_amount > max_withdraw:
+                actual_amount = max_withdraw
+                logger.info(f"⚠️ 期望金额 ({desired_amount:.6f}) 超过最大可取出 ({max_withdraw:.6f})")
+                logger.info(f"   将使用最大可取出金额")
+            else:
+                actual_amount = desired_amount
+            
+            logger.info(f"📊 取出金额计算:")
+            logger.info(f"   最大可取出: {max_withdraw:.6f}")
+            logger.info(f"   可取出20%: {twenty_percent_of_max:.6f}")
+            logger.info(f"   配置取出金额: {withdraw_amount:.6f}")
+            logger.info(f"   期望取出金额: max(20%, 配置) = {desired_amount:.6f}")
+            logger.info(f"   实际取出金额: {actual_amount:.6f}")
         
         logger.info(f"✅ 满足取出条件，开始执行withdraw操作")
         
@@ -531,11 +561,18 @@ def main():
             # 循环执行模式
             logger.info(f"\n� 开始循环执行，每 {args.interval} 秒检查一次")
             logger.info(f"💡 按 Ctrl+C 停止程序")
+            logger.info(f"💡 首次成功后将切换到快速模式（1秒间隔），直到首次失败")
             logger.info("=" * 60)
             
             cycle_count = 0
             success_count = 0
             fail_count = 0
+            
+            # 动态间隔控制
+            original_interval = args.interval  # 原始间隔
+            current_interval = original_interval  # 当前使用的间隔
+            first_success = False  # 是否已经有第一次成功
+            fast_mode_active = False  # 快速模式是否激活
             
             while True:
                 cycle_count += 1
@@ -543,24 +580,43 @@ def main():
                 
                 logger.info(f"\n{'='*60}")
                 logger.info(f"🔄 第 {cycle_count} 次检查 - {current_time}")
+                if fast_mode_active:
+                    logger.info(f"⚡ 快速模式已激活（1秒间隔）")
                 logger.info(f"{'='*60}")
                 
                 success = run_withdraw_cycle(lista, args.amount, enable_sound=not args.no_sound)
                 
                 if success:
                     success_count += 1
+                    
+                    # 如果这是第一次成功，切换到快速模式
+                    if not first_success:
+                        first_success = True
+                        fast_mode_active = True
+                        current_interval = 1  # 切换到1秒间隔
+                        logger.info(f"\n🎉 首次交易成功！")
+                        logger.info(f"⚡ 切换到快速模式：间隔从 {original_interval} 秒改为 1 秒")
+                        logger.info(f"💡 将持续快速执行直到首次失败")
                 else:
                     fail_count += 1
+                    
+                    # 如果在快速模式下失败，恢复原始间隔
+                    if fast_mode_active:
+                        fast_mode_active = False
+                        current_interval = original_interval
+                        logger.info(f"\n⚠️ 快速模式下首次失败！")
+                        logger.info(f"🔄 恢复原始间隔：从 1 秒改回 {original_interval} 秒")
                 
                 logger.info(f"\n📊 统计信息:")
                 logger.info(f"   总检查次数: {cycle_count}")
                 logger.info(f"   成功取出: {success_count}")
                 logger.info(f"   跳过/失败: {fail_count}")
+                logger.info(f"   当前模式: {'⚡ 快速模式 (1秒)' if fast_mode_active else f'🐢 正常模式 ({original_interval}秒)'}")
                 
                 # 等待下次检查
-                logger.info(f"\n⏰ 等待 {args.interval} 秒后进行下次检查...")
+                logger.info(f"\n⏰ 等待 {current_interval} 秒后进行下次检查...")
                 logger.info(f"{'='*60}")
-                time.sleep(args.interval)
+                time.sleep(current_interval)
     
     except KeyboardInterrupt:
         logger.info(f"\n\n🛑 收到停止信号，程序退出")
