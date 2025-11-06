@@ -134,3 +134,4 @@ dmypy.json
 .pyre/
 alert.mp3
 .DS_Store
+nohup.out

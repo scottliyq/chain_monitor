@@ -24,6 +24,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# 导入音频播放模块
+try:
+    from audio_player import play_alert_sound
+    AUDIO_AVAILABLE = True
+except ImportError:
+    AUDIO_AVAILABLE = False
+    logger.warning("⚠️ 音频播放模块不可用")
+
 # 加载环境变量
 load_dotenv()
 
@@ -181,37 +189,67 @@ class ListaWithdraw:
             # 构建交易
             logger.info(f"🔨 构建交易...")
             
+            # 先尝试估算gas，如果失败再构建交易
+            try:
+                # 先用call模拟一下，看看是否会成功
+                result = self.contract.functions.withdraw(
+                    amount_wei,
+                    Web3.to_checksum_address(receiver),
+                    Web3.to_checksum_address(owner)
+                ).call({'from': self.wallet_address})
+                
+                logger.info(f"✅ 模拟调用成功，预计获得 {self.w3.from_wei(result, 'ether'):.6f} shares")
+                
+            except Exception as call_error:
+                logger.error(f"❌ 模拟调用失败: {call_error}")
+                logger.error(f"   这意味着交易会失败，请检查:")
+                logger.error(f"   1. 合约是否有足够的流动性")
+                logger.error(f"   2. 是否有权限执行withdraw")
+                logger.error(f"   3. 是否有其他限制条件")
+                return None
+            
             # 调用withdraw函数
             # withdraw(uint256 assets, address receiver, address owner)
-            tx = self.contract.functions.withdraw(
-                amount_wei,
-                Web3.to_checksum_address(receiver),
-                Web3.to_checksum_address(owner)
-            ).build_transaction({
+            # 注意：不要在这里设置 gas，让 estimate_gas 自动估算
+            tx_params = {
                 'from': self.wallet_address,
                 'nonce': nonce,
-                'gas': 500000,  # 预估gas limit
                 'gasPrice': gas_price,
                 'chainId': 56  # BSC链ID
-            })
+            }
             
-            logger.info(f"✅ 交易构建成功")
-            logger.info(f"   Gas Limit: {tx['gas']}")
-            
-            # 估算实际需要的gas
+            # 先尝试估算 gas，如果成功再构建完整交易
+            logger.info(f"🔍 估算所需Gas...")
             try:
-                estimated_gas = self.w3.eth.estimate_gas(tx)
-                logger.info(f"📊 估算Gas: {estimated_gas}")
+                # 不设置 gas 参数，让 estimate_gas 自动估算
+                tx_estimate = self.contract.functions.withdraw(
+                    amount_wei,
+                    Web3.to_checksum_address(receiver),
+                    Web3.to_checksum_address(owner)
+                ).build_transaction(tx_params)
+                
+                estimated_gas = self.w3.eth.estimate_gas(tx_estimate)
+                logger.info(f"✅ Gas估算成功: {estimated_gas:,}")
+                
                 # 使用估算的gas并增加20%作为缓冲
-                tx['gas'] = int(estimated_gas * 1.2)
-                logger.info(f"   调整后Gas Limit: {tx['gas']}")
+                final_gas = int(estimated_gas * 1.2)
+                logger.info(f"📊 最终Gas Limit: {final_gas:,} (估算值 + 20% 缓冲)")
+                
+                # 构建最终交易
+                tx_params['gas'] = final_gas
+                tx = self.contract.functions.withdraw(
+                    amount_wei,
+                    Web3.to_checksum_address(receiver),
+                    Web3.to_checksum_address(owner)
+                ).build_transaction(tx_params)
+                
             except Exception as e:
-                logger.warning(f"⚠️ Gas估算失败，使用默认值: {e}")
-                logger.warning(f"⚠️ 这可能表示交易会失败，原因可能是:")
-                logger.warning(f"   1. 合约余额不足")
-                logger.warning(f"   2. 没有权限执行withdraw")
-                logger.warning(f"   3. 取出金额超过可用余额")
-                logger.warning(f"   4. 合约有其他限制条件")
+                logger.error(f"❌ Gas估算失败: {e}")
+                logger.error(f"⚠️ 交易会失败，原因可能是:")
+                logger.error(f"   1. 合约流动性不足（资金被锁定在策略中）")
+                logger.error(f"   2. 没有权限执行withdraw")
+                logger.error(f"   3. 合约有时间锁或其他限制条件")
+                logger.error(f"   4. 需要先执行其他操作才能提取")
                 
                 # 尝试获取更多信息
                 try:
@@ -225,9 +263,12 @@ class ListaWithdraw:
                     
                     if amount_wei > max_withdraw:
                         logger.error(f"   ❌ 错误: 取出金额 ({amount}) 超过最大可取出金额 ({self.w3.from_wei(max_withdraw, 'ether'):.6f})")
-                        return None
                 except Exception as check_error:
                     logger.warning(f"   无法获取详细信息: {check_error}")
+                
+                # Gas估算失败说明交易一定会失败，直接返回不发送交易
+                logger.error(f"🛑 由于Gas估算失败，跳过交易发送以避免浪费gas费")
+                return None
             
             # 签名交易
             logger.info(f"✍️ 签名交易...")
@@ -235,7 +276,15 @@ class ListaWithdraw:
             
             # 发送交易
             logger.info(f"📤 发送交易...")
-            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            # 兼容不同版本的web3.py
+            if hasattr(signed_tx, 'rawTransaction'):
+                raw_tx = signed_tx.rawTransaction
+            elif hasattr(signed_tx, 'raw_transaction'):
+                raw_tx = signed_tx.raw_transaction
+            else:
+                raise AttributeError("SignedTransaction对象没有rawTransaction或raw_transaction属性")
+            
+            tx_hash = self.w3.eth.send_raw_transaction(raw_tx)
             tx_hash_hex = tx_hash.hex()
             
             logger.info(f"✅ 交易已发送!")
@@ -332,13 +381,14 @@ class ListaWithdraw:
             pass
 
 
-def run_withdraw_cycle(lista: ListaWithdraw, withdraw_amount: float) -> bool:
+def run_withdraw_cycle(lista: ListaWithdraw, withdraw_amount: float, enable_sound: bool = True) -> bool:
     """
     执行一次withdraw周期
     
     Args:
         lista: ListaWithdraw实例
         withdraw_amount: 配置的取出金额
+        enable_sound: 是否启用音频提示，默认True
         
     Returns:
         是否成功执行withdraw
@@ -356,21 +406,30 @@ def run_withdraw_cycle(lista: ListaWithdraw, withdraw_amount: float) -> bool:
             logger.warning(f"⏭️ 跳过本次取出，等待下次检查")
             return False
         
+        # 🔔 满足条件：可取出金额大于配置金额，播放提示音
+        logger.info(f"🎉 检测到可取出金额 ({max_withdraw:.6f}) >= 配置金额 ({withdraw_amount:.6f})")
+        
+        if enable_sound and AUDIO_AVAILABLE:
+            try:
+                logger.info(f"🔔 播放提示音...")
+                play_alert_sound()
+            except Exception as e:
+                logger.warning(f"⚠️ 播放提示音失败: {e}")
+        elif not enable_sound:
+            logger.info(f"🔇 音频提示已关闭")
+        
         # 计算实际取出金额
-        # 规则：max(最大可取出 * 70%, 配置金额)，但不超过最大可取出 * 90%
-        amount_70_percent = max_withdraw * 0.7
-        amount_90_percent = max_withdraw * 0.9
-        
-        # 取70%和配置金额中的较大值
-        actual_amount = max(amount_70_percent, withdraw_amount)
-        
-        # 确保不超过90%
-        if actual_amount > amount_90_percent:
-            actual_amount = amount_90_percent
+        # 规则：使用配置金额，但不超过最大可取出金额
+        # 如果配置金额超过最大可取出，则使用最大可取出金额
+        if withdraw_amount > max_withdraw:
+            actual_amount = max_withdraw
+            logger.info(f"⚠️ 配置金额 ({withdraw_amount:.6f}) 超过最大可取出 ({max_withdraw:.6f})")
+            logger.info(f"   将使用最大可取出金额")
+        else:
+            actual_amount = withdraw_amount
         
         logger.info(f"📊 取出金额计算:")
-        logger.info(f"   最大可取出 70%: {amount_70_percent:.6f}")
-        logger.info(f"   最大可取出 90%: {amount_90_percent:.6f}")
+        logger.info(f"   最大可取出: {max_withdraw:.6f}")
         logger.info(f"   配置取出金额: {withdraw_amount:.6f}")
         logger.info(f"   实际取出金额: {actual_amount:.6f}")
         
@@ -404,11 +463,14 @@ def main():
   # 每60秒检查一次，每次取出0.5个代币
   python lista_withdraw.py --interval 60 --amount 0.5
   
-  # 每30秒检查一次，每次取出1个代币
-  python lista_withdraw.py --interval 30 --amount 1.0
+  # 每30秒检查一次，每次取出1个代币，关闭音频提示
+  python lista_withdraw.py --interval 30 --amount 1.0 --no-sound
   
   # 只执行一次（不循环）
   python lista_withdraw.py --amount 0.5 --once
+  
+  # 只执行一次，关闭音频提示
+  python lista_withdraw.py --amount 0.5 --once --no-sound
         """
     )
     
@@ -432,6 +494,12 @@ def main():
         help='只执行一次，不循环'
     )
     
+    parser.add_argument(
+        '--no-sound',
+        action='store_true',
+        help='关闭音频提示'
+    )
+    
     args = parser.parse_args()
     
     logger.info("🚀 Lista MEV合约定期Withdraw工具")
@@ -440,6 +508,7 @@ def main():
     logger.info(f"   检查间隔: {args.interval} 秒")
     logger.info(f"   取出金额: {args.amount}")
     logger.info(f"   运行模式: {'单次执行' if args.once else '循环执行'}")
+    logger.info(f"   音频提示: {'关闭' if args.no_sound else '开启'}")
     logger.info("=" * 60)
     
     try:
@@ -453,7 +522,7 @@ def main():
             # 单次执行模式
             logger.info(f"\n🔄 执行单次withdraw检查")
             logger.info("=" * 60)
-            success = run_withdraw_cycle(lista, args.amount)
+            success = run_withdraw_cycle(lista, args.amount, enable_sound=not args.no_sound)
             if success:
                 logger.info(f"\n✅ 单次执行完成")
             else:
@@ -476,7 +545,7 @@ def main():
                 logger.info(f"🔄 第 {cycle_count} 次检查 - {current_time}")
                 logger.info(f"{'='*60}")
                 
-                success = run_withdraw_cycle(lista, args.amount)
+                success = run_withdraw_cycle(lista, args.amount, enable_sound=not args.no_sound)
                 
                 if success:
                     success_count += 1
