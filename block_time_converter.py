@@ -15,14 +15,27 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class BlockTimeConverter:
-    def __init__(self):
-        """初始化区块时间转换器"""
-        # API配置
-        self.etherscan_api_key = os.getenv('ETHERSCAN_API_KEY', 'YourApiKeyToken')
-        self.etherscan_api_url = "https://api.etherscan.io/v2/api"  # 使用V2 API
+    def __init__(self, api_config=None):
+        """初始化区块时间转换器
+        
+        Args:
+            api_config (dict): API配置，包含base_url和api_key
+                              如果不提供，默认使用以太坊配置
+        """
+        if api_config:
+            # 使用传入的网络特定API配置
+            self.api_url = api_config["base_url"]
+            self.api_key = api_config["api_key"]
+            self.chain_id = api_config["chain_id"]
+        else:
+            # 默认使用以太坊配置（向后兼容）
+            self.api_key = os.getenv('ETHERSCAN_API_KEY', 'YourApiKeyToken')
+            self.api_url = "https://api.etherscan.io/v2/api"  # 使用v2接口
+            self.chain_id = 1
         
         print(f"🔧 配置信息:")
-        print(f"   Etherscan API: {'***' + self.etherscan_api_key[-4:] if len(self.etherscan_api_key) > 4 else 'YourApiKeyToken'}")
+        print(f"   API端点: {self.api_url}")
+        print(f"   API密钥: {'***' + self.api_key[-4:] if len(self.api_key) > 4 else 'YourApiKeyToken'}")
         print()
     
     def datetime_to_timestamp(self, dt_str):
@@ -83,15 +96,15 @@ class BlockTimeConverter:
             print(f"🔍 查询时间戳 {timestamp} ({utc_time.strftime('%Y-%m-%d %H:%M:%S')} UTC) 对应的区块号...")
             
             params = {
-                'chainid': 1,  # 以太坊主网
+                'chainid': self.chain_id,  # 添加chainid参数
                 'module': 'block',
                 'action': 'getblocknobytime',
                 'timestamp': timestamp,
                 'closest': closest,
-                'apikey': self.etherscan_api_key
+                'apikey': self.api_key
             }
             
-            response = requests.get(self.etherscan_api_url, params=params, timeout=30)
+            response = requests.get(self.api_url, params=params, timeout=30)
             data = response.json()
             
             if data['status'] == '1':
@@ -106,6 +119,67 @@ class BlockTimeConverter:
             print(f"   ❌ 查询区块号失败: {e}")
             return None
     
+    def get_latest_block_number(self):
+        """获取最新区块号"""
+        try:
+            params = {
+                'chainid': self.chain_id,  # 添加chainid参数
+                'module': 'proxy',
+                'action': 'eth_blockNumber',
+                'apikey': self.api_key
+            }
+            
+            response = requests.get(self.api_url, params=params, timeout=30)
+            data = response.json()
+            
+            if 'result' in data:
+                # 将十六进制转换为十进制
+                return int(data['result'], 16)
+            else:
+                print(f"   ❌ 获取最新区块号失败: {data}")
+                return None
+                
+        except Exception as e:
+            print(f"   ❌ 获取最新区块号失败: {e}")
+            return None
+    
+    def get_block_info(self, block_number):
+        """获取区块详细信息"""
+        try:
+            params = {
+                'chainid': self.chain_id,  # 添加chainid参数
+                'module': 'proxy',
+                'action': 'eth_getBlockByNumber',
+                'tag': hex(block_number),
+                'boolean': 'true',
+                'apikey': self.api_key
+            }
+            
+            response = requests.get(self.api_url, params=params, timeout=30)
+            data = response.json()
+            
+            if 'result' in data and data['result']:
+                result = data['result']
+                # 转换时间戳
+                timestamp = int(result['timestamp'], 16)
+                return {
+                    'number': int(result['number'], 16),
+                    'hash': result['hash'],
+                    'timestamp': timestamp,
+                    'datetime': datetime.fromtimestamp(timestamp, tz=timezone.utc),
+                    'miner': result.get('miner', 'N/A'),
+                    'transactions': result.get('transactions', []),
+                    'gasUsed': result.get('gasUsed', '0x0'),
+                    'gasLimit': result.get('gasLimit', '0x0')
+                }
+            else:
+                print(f"   ❌ 获取区块信息失败: {data}")
+                return None
+                
+        except Exception as e:
+            print(f"   ❌ 获取区块信息失败: {e}")
+            return None
+    
     def get_block_details(self, block_number):
         """获取区块详细信息
         
@@ -117,15 +191,15 @@ class BlockTimeConverter:
         """
         try:
             params = {
-                'chainid': 1,  # 以太坊主网
+                'chainid': self.chain_id,
                 'module': 'proxy',
                 'action': 'eth_getBlockByNumber',
                 'tag': hex(block_number),
-                'boolean': 'false',
-                'apikey': self.etherscan_api_key
+                'boolean': 'true',
+                'apikey': self.api_key
             }
             
-            response = requests.get(self.etherscan_api_url, params=params, timeout=30)
+            response = requests.get(self.api_url, params=params, timeout=30)
             data = response.json()
             
             if 'result' in data and data['result']:

@@ -27,6 +27,10 @@ share/python-wheels/
 *.egg
 MANIFEST
 temp/
+test/
+results/
+logs/
+monitor_output/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -128,3 +132,8 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+alert.mp3
+.DS_Store
+nohup.out
+nohup.out
+nohup.out
