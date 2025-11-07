@@ -22,12 +22,13 @@ from eth_account import Account
 load_dotenv()
 
 class Stable2Interaction:
-    def __init__(self, mock_mode=False, preprod_mode=False):
+    def __init__(self, mock_mode=False, preprod_mode=False, custom_gas_price=None):
         """初始化合约交互器
         
         Args:
             mock_mode (bool): 是否使用mock模式（Impersonate）
             preprod_mode (bool): 是否使用preprod模式（本地RPC + 真实签名）
+            custom_gas_price (int): 自定义gas price（单位：Wei），如果为None则自动获取
         """
         # 合约地址
         self.STABLE2_ADDRESS = Web3.to_checksum_address("0xd9b2CB2FBAD204Fc548787EF56B918c845FCce40")
@@ -36,6 +37,7 @@ class Stable2Interaction:
         # 模式设置
         self.mock_mode = mock_mode
         self.preprod_mode = preprod_mode
+        self.custom_gas_price = custom_gas_price
         
         # 确保不会同时启用两种模式
         if mock_mode and preprod_mode:
@@ -383,14 +385,26 @@ class Stable2Interaction:
             print(f"   请确保使用支持impersonate的本地节点（Anvil/Hardhat）")
             raise
     
-    def _build_transaction(self, contract_function, gas_limit=None):
-        """构建交易"""
+    def _build_transaction(self, contract_function, gas_limit=None, gas_price_multiplier=1.0):
+        """构建交易
+        
+        Args:
+            contract_function: 合约函数调用
+            gas_limit: 指定gas限制（如果为None则自动估算）
+            gas_price_multiplier: gas价格倍数（1.0=标准, 1.2=快速, 0.8=慢速）
+        """
         try:
             # 获取nonce
             nonce = self.web3.eth.get_transaction_count(self.wallet_address)
             
             # 获取gas price
-            gas_price = self.web3.eth.gas_price
+            if self.custom_gas_price is not None:
+                # 使用自定义 gas price
+                gas_price = self.custom_gas_price
+            else:
+                # 自动获取并应用倍数
+                base_gas_price = self.web3.eth.gas_price
+                gas_price = int(base_gas_price * gas_price_multiplier)
             
             # 构建交易基础参数
             txn_params = {
@@ -400,9 +414,19 @@ class Stable2Interaction:
                 'chainId': self.network_id
             }
             
-            # 估算gas或使用指定的gas limit
+            # 估算gas（优先使用动态估算）
             if gas_limit:
-                txn_params['gas'] = gas_limit
+                # 即使提供了gas_limit，也尝试估算以验证
+                try:
+                    estimated_gas = contract_function.estimate_gas(txn_params)
+                    # 使用估算值和提供值中的较大者
+                    actual_gas = max(int(estimated_gas * 1.2), gas_limit)
+                    txn_params['gas'] = actual_gas
+                    if actual_gas > gas_limit:
+                        print(f"   ⚠️ 估算gas ({estimated_gas:,}) 超过指定值 ({gas_limit:,})，使用估算值: {actual_gas:,}")
+                except Exception as e:
+                    print(f"   ⚠️ Gas估算失败，使用指定值: {gas_limit:,}")
+                    txn_params['gas'] = gas_limit
             else:
                 estimated_gas = contract_function.estimate_gas(txn_params)
                 txn_params['gas'] = int(estimated_gas * 1.2)  # 增加20%缓冲
@@ -482,13 +506,13 @@ class Stable2Interaction:
                 amount_raw = int(Decimal(amount) * Decimal(10 ** usdc_decimals))
                 print(f"   授权数量: {amount:,.6f} USDC")
             
-            # 构建交易
+            # 构建交易（使用动态gas估算）
             approve_txn = self._build_transaction(
                 self.usdc_contract.functions.approve(
                     self.STABLE2_ADDRESS,
                     amount_raw
-                ),
-                gas_limit=100000
+                )
+                # 不指定gas_limit，让其自动估算
             )
             
             print(f"   交易详情:")
@@ -556,10 +580,10 @@ class Stable2Interaction:
                     pass
                 raise Exception(f"存款模拟失败，交易可能会revert: {sim_error}")
             
-            # 构建交易
+            # 构建交易（使用动态gas估算）
             deposit_txn = self._build_transaction(
-                contract_function,
-                gas_limit=300000  # 增加gas限制
+                contract_function
+                # 不指定gas_limit，让其自动估算
             )
             
             print(f"   交易详情:")
@@ -682,11 +706,13 @@ def main():
         print("模式选项:")
         print("  --mock                     - 使用Mock模式（Impersonate）")
         print("  --preprod                  - 使用Preprod模式（本地RPC + 真实签名）")
+        print("  --gas-price <gwei>         - 指定gas price（单位：Gwei，如：40）")
         print()
         print("示例:")
         print("  python stable2_interaction.py balance")
         print("  python stable2_interaction.py approve")
         print("  python stable2_interaction.py deposit 100")
+        print("  python stable2_interaction.py deposit 100 --gas-price 40")
         print("  python stable2_interaction.py all 100")
         print("  python stable2_interaction.py --mock balance")
         print("  python stable2_interaction.py --preprod deposit 100")
@@ -700,6 +726,25 @@ def main():
         mock_mode = '--mock' in args
         preprod_mode = '--preprod' in args
         
+        # 检查 gas price 参数
+        custom_gas_price = None
+        if '--gas-price' in args:
+            try:
+                gas_price_idx = args.index('--gas-price')
+                if gas_price_idx + 1 < len(args):
+                    gas_price_gwei = float(args[gas_price_idx + 1])
+                    custom_gas_price = Web3.to_wei(gas_price_gwei, 'gwei')
+                    print(f"💡 使用自定义 Gas Price: {gas_price_gwei} Gwei")
+                    # 移除 gas price 参数
+                    args.pop(gas_price_idx)  # 移除 --gas-price
+                    args.pop(gas_price_idx)  # 移除数值
+                else:
+                    print("❌ --gas-price 需要指定数值（单位：Gwei）")
+                    sys.exit(1)
+            except (ValueError, IndexError) as e:
+                print(f"❌ --gas-price 参数格式错误: {e}")
+                sys.exit(1)
+        
         # 移除模式标志
         args = [arg for arg in args if arg not in ['--mock', '--preprod']]
         
@@ -710,7 +755,11 @@ def main():
         operation = args[0].lower()
         
         # 创建交互器实例
-        interactor = Stable2Interaction(mock_mode=mock_mode, preprod_mode=preprod_mode)
+        interactor = Stable2Interaction(
+            mock_mode=mock_mode, 
+            preprod_mode=preprod_mode,
+            custom_gas_price=custom_gas_price
+        )
         
         if operation == "config":
             # 显示配置
