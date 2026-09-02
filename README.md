@@ -231,7 +231,40 @@ python tests/test_historical_token_balance_checker.py
 python examples/example_usage.py
 ```
 
-## 6. 当前需要优先修复的结构性问题
+### 5.5 分析某个地址最近 3 天收到的 ETH 金额分布
+
+```bash
+conda activate py31evm
+python src/eth_receive_distribution_analyzer.py \
+  --address 0x0fca5194baa59a362a835031d9c4a25970effe68 \
+  --days 3
+```
+
+如果你想排除 internal 交易，只看普通转入：
+
+```bash
+conda activate py31evm
+python src/eth_receive_distribution_analyzer.py \
+  --address 0x0fca5194baa59a362a835031d9c4a25970effe68 \
+  --days 3 \
+  --no-internal
+```
+
+结果会输出到 `results/` 目录，包含 JSON 明细和文本报告。
+
+## 6. 本次更新记录
+
+### 2026-04-25
+
+- 新增 `src/analysis/eth_receive_distribution_analyzer.py`，用于分析目标地址在给定时间窗口内收到的原生 ETH 金额分布。
+- 新增 `src/eth_receive_distribution_analyzer.py` 兼容入口，保持仓库现有 `src/` 根目录脚本调用习惯。
+- 新增 `tests/test_eth_receive_distribution_analyzer.py`，覆盖金额分桶和汇总统计逻辑。
+
+修改原因：
+
+- 需要基于仓库现有的 Etherscan v2 API、`chain_config` 和 `BlockTimeConverter`，快速复用现有架构实现“最近 3 天收到的 ETH 金额分布”分析，而不是再引入一套新依赖或新数据源。
+
+## 7. 当前需要优先修复的结构性问题
 
 ### P0 - 依赖与环境不一致
 
