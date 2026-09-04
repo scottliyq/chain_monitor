@@ -23,7 +23,7 @@ from analysis.robinhood_rwa_uniswap_monitor import (
     WindowRanking,
 )
 from analysis.uniswap_v4_fee_analyzer import PoolMetadata
-from core.rpc_pool import mask_rpc_url, parse_rpc_urls
+from core.rpc_pool import RotatingHTTPProvider, mask_rpc_url, parse_rpc_urls
 from core.supabase_repository import SupabaseConfig, SupabaseRepository
 from core.supabase_repository import load_supabase_config
 
@@ -222,6 +222,44 @@ class TestRobinhoodRwaUniswapMonitor(unittest.TestCase):
                     "https://rpc.mainnet.chain.robinhood.com",
                 ),
             )
+
+    def test_rpc_request_scope_keeps_block_reads_on_one_endpoint(self) -> None:
+        provider = RotatingHTTPProvider(
+            ("https://one.example", "https://two.example"),
+            cooldown_seconds=0,
+        )
+        first = Mock()
+        second = Mock()
+        first.make_request.return_value = {"result": "0x1"}
+        second.make_request.return_value = {"result": "0x1"}
+        provider._providers = (first, second)
+
+        with provider.request_scope():
+            provider.make_request("eth_blockNumber", [])
+            provider.make_request("eth_getBlockByNumber", ["0x1", False])
+
+        self.assertEqual(first.make_request.call_count, 2)
+        self.assertEqual(second.make_request.call_count, 0)
+
+    def test_rpc_request_scope_fails_over_when_block_is_missing(self) -> None:
+        provider = RotatingHTTPProvider(
+            ("https://one.example", "https://two.example"),
+            cooldown_seconds=0,
+        )
+        first = Mock()
+        second = Mock()
+        first.make_request.return_value = {
+            "error": {"code": -32000, "message": "block not found"},
+        }
+        second.make_request.return_value = {"result": "0x1"}
+        provider._providers = (first, second)
+
+        with provider.request_scope():
+            response = provider.make_request("eth_getBlockByNumber", ["0x1", False])
+
+        self.assertEqual(response, {"result": "0x1"})
+        self.assertEqual(first.make_request.call_count, 1)
+        self.assertEqual(second.make_request.call_count, 1)
 
     def test_calculate_yield_percent(self) -> None:
         self.assertEqual(calculate_yield_percent(Decimal("2"), Decimal("100")), 2.0)

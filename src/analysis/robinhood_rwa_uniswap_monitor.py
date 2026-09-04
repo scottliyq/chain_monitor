@@ -1125,6 +1125,12 @@ class RobinhoodRwaUniswapMonitor:
         )
 
     def run_once(self) -> dict[str, object]:
+        """固定一个 RPC 节点完成一轮扫描，并写入 JSON/CSV 报告。"""
+
+        with self.rpc_provider.request_scope():
+            return self._run_once()
+
+    def _run_once(self) -> dict[str, object]:
         """同步资产、扫描池和交易，并写入 JSON/CSV 报告。"""
 
         assets = self.registry.sync()

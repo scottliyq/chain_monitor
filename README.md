@@ -369,7 +369,9 @@ cron/systemd 定时执行。
 Robinhood Chain 官方文档列出的主网 RPC 包括官方公共 RPC，以及需要账号/密钥的
 Alchemy、QuickNode、Blockdaemon、dRPC、Validation Cloud、Chainstack 和 GlobalStake。大批量历史扫描建议把
 已申请的节点放在 `ROBINHOOD_RPC_URLS` 中，用逗号分隔；程序会按请求轮询，并在
-429、超时或临时服务错误时切换节点。API key/token 不会写入日志或报告。
+429、超时、临时服务错误或 `BlockNotFound` 时切换节点。为避免不同节点链头
+不同导致区块读取失败，每一轮 `run_once()` 会固定使用一个 RPC；只有当前节点
+发生可重试故障时才切换到下一个节点。API key/token 不会写入日志或报告。
 也可以分别设置 `ALCHEMY_RPC_URL`、`TATUM_RPC_URL`、`ROBINHOOD_RPC_URL`；未传
 `--rpc-url` 时程序会收集所有已配置的这些变量并去重轮询。
 

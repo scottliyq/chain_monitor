@@ -3,9 +3,10 @@
 import os
 import re
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Iterator, Mapping
 from urllib.parse import urlsplit, urlunsplit
 
 import requests
@@ -34,6 +35,9 @@ RETRYABLE_ERROR_WORDS = (
     "gateway",
     "response too large",
     "logs matched",
+    "block not found",
+    "header not found",
+    "unknown block",
 )
 
 
@@ -131,6 +135,7 @@ class RotatingHTTPProvider(HTTPProvider):
         self.cooldown_seconds = cooldown_seconds
         self.max_attempts = max_attempts or len(normalized)
         self._next_index = 0
+        self._scope_index: int | None = None
         self._cooldown_until: dict[str, float] = {}
         self._providers = tuple(
             HTTPProvider(
@@ -148,6 +153,16 @@ class RotatingHTTPProvider(HTTPProvider):
 
     def _candidate_indices(self) -> list[int]:
         now = time.monotonic()
+        if self._scope_index is not None:
+            scoped_candidates = [
+                (self._scope_index + offset) % len(self.endpoints)
+                for offset in range(len(self.endpoints))
+                if self._cooldown_until.get(
+                    self.endpoints[(self._scope_index + offset) % len(self.endpoints)], 0
+                )
+                <= now
+            ]
+            return scoped_candidates or [self._scope_index]
         candidates = [
             (self._next_index + offset) % len(self.endpoints)
             for offset in range(len(self.endpoints))
@@ -157,6 +172,18 @@ class RotatingHTTPProvider(HTTPProvider):
             <= now
         ]
         return candidates or [self._next_index]
+
+    @contextmanager
+    def request_scope(self) -> Iterator[None]:
+        """固定一个 RPC 节点处理一组有区块一致性要求的请求。"""
+
+        previous_scope_index = self._scope_index
+        candidates = self._candidate_indices()
+        self._scope_index = candidates[0]
+        try:
+            yield
+        finally:
+            self._scope_index = previous_scope_index
 
     def make_request(self, method: Any, params: Any) -> Any:
         """轮询发起 JSON-RPC 请求；所有节点失败时返回最后一个响应/异常。"""
@@ -176,6 +203,8 @@ class RotatingHTTPProvider(HTTPProvider):
                     self._cooldown_until[endpoint] = time.monotonic() + self.cooldown_seconds
                     continue
                 self._next_index = (index + 1) % len(self.endpoints)
+                if self._scope_index is not None:
+                    self._scope_index = index
                 return response
             except requests.RequestException as error:
                 last_error = error
