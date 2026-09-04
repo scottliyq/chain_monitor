@@ -197,13 +197,11 @@ const { data, error } = await supabase
   .select("token,pool_address,pool,tvl_usd,volume_24h_usd,fee_apr,current_apr,apr_2h,rank_2h,rank_24h,is_new_issue,new_issue_discovered_at,metric_time,sync_time")
   .eq("chain_id", 4663)
   .eq("asset_scope", "all_active")
-  .eq("is_new_issue", true)
-  .order("rank_24h", { ascending: true })
-  .limit(10);
+  .order("rank_24h", { ascending: true });
 ```
 
-该查询只返回池内存在 24 小时内新发行股票的池；若页面需要完整全量池列表，去掉
-`.eq("is_new_issue", true)` 即可。若页面只需要官方排名原始字段，继续查询
+该查询返回 `all_active` 范围内的全部已发现池；前端可根据 `is_new_issue`、股票名称、排序和分页自行过滤。
+没有近期 Swap 的池，其收益指标可能为 `null`，但仍会保留在 dashboard 中。若页面只需要官方排名原始字段，继续查询
 `rh_pool_window_rankings`；若需要池列表页面的 TVL、24h 成交量、两个 APR、同步时间和新发行标记，使用本视图。
 
 ## 11. 字段取值检查
@@ -234,3 +232,13 @@ supabase/migrations/20260904000002_fix_rh_pool_dashboard_division.sql
 ```
 
 修复后，零费率事件不会中断整张视图；对应池的 `volume_24h_usd` 会返回 `null`，因为无法从零费率反推出交易量。手续费、池规模和收益率仍按窗口排名表原有口径返回。
+
+已有数据库还需执行以下 migration：
+
+```text
+supabase/migrations/20260904000003_add_new_issue_tracking.sql
+supabase/migrations/20260904000004_dashboard_all_pools.sql
+```
+
+其中 `00004` 将窗口排名的候选池来源从“有小时 Swap 指标的池”改为“全量已发现池”，
+因此没有近期 Swap 的池也会显示，但收益指标保持 `null` 或 `partial`。

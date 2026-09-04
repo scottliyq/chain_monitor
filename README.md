@@ -452,8 +452,8 @@ const { data, error } = await supabase
 `pool_manager_address`。Service role key 只允许 Worker 使用，前端使用 anon key，
 数据库 RLS 仅向前端开放 `rh_pool_window_rankings` 的只读访问。
 
-如果前端页面需要池元数据、2h/24h 排名和新发行标记，可直接读取后续 migration 创建的
-`rh_pool_dashboard`，避免把池元数据、排名和资产标记在前端手动关联：
+如果前端页面需要全量池元数据、2h/24h 排名和新发行标记，可直接读取后续 migration 创建的
+`rh_pool_dashboard`，再由前端按 `is_new_issue`、股票名称、排序和分页过滤：
 
 ```typescript
 const { data, error } = await supabase
@@ -461,15 +461,14 @@ const { data, error } = await supabase
   .select("token,pool_address,pool,tvl_usd,volume_24h_usd,fee_apr,current_apr,apr_2h,rank_2h,rank_24h,is_new_issue,new_issue_discovered_at,metric_time,sync_time")
   .eq("chain_id", 4663)
   .eq("asset_scope", "all_active")
-  .eq("is_new_issue", true)
-  .order("rank_24h", { ascending: true })
-  .limit(10);
+  .order("rank_24h", { ascending: true });
 ```
 
 `rh_pool_dashboard` 的首次 migration 为
 `supabase/migrations/20260904000001_create_rh_pool_dashboard_view.sql`；如果该文件已经执行，需继续执行
 `supabase/migrations/20260904000002_fix_rh_pool_dashboard_division.sql` 修复零费率 Swap 的除零问题，
-已有数据库还需执行 `supabase/migrations/20260904000003_add_new_issue_tracking.sql` 增加新发行字段。其中
+已有数据库还需执行 `supabase/migrations/20260904000003_add_new_issue_tracking.sql` 增加新发行字段，
+以及 `supabase/migrations/20260904000004_dashboard_all_pools.sql` 让 dashboard 包含全部已发现池。其中
 `fee_apr` 是 24h 线性年化收益率，`apr_2h` 是 2h 线性年化收益率，
 `volume_24h_usd` 根据最近 24h Swap 的手续费和实际 fee pips 反推输入量 USD；缺少价格或费率时返回 `null`，不伪造为 0。
 
@@ -514,6 +513,7 @@ const { data, error } = await supabase
 - Uniswap v4 池初始化扫描改为使用全量 active 股票，不再按前 20 个资产筛选；本地报告增加全量 `assets` 和新发行股票摘要。
 - `rh_pool_dashboard` 增加 `is_new_issue` 和 `new_issue_discovered_at`，前端可直接筛选 24 小时内新发行股票对应的池。
 - 新增 `supabase/migrations/20260904000003_add_new_issue_tracking.sql`，用于已有数据库升级。
+- 新增 `supabase/migrations/20260904000004_dashboard_all_pools.sql`，使 dashboard 包含全量已发现股票池；无近期 Swap 的池仍保留，收益指标显示为 `null` 或 `partial`。
 
 修改原因：
 

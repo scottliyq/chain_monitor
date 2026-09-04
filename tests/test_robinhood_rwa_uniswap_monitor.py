@@ -201,6 +201,15 @@ class TestRobinhoodRwaUniswapMonitor(unittest.TestCase):
         for field in ("is_new_issue", "new_issue_discovered_at"):
             self.assertIn(f" as {field}", upgrade.lower())
 
+    def test_dashboard_ranking_candidates_include_all_registered_pools(self) -> None:
+        migration_path = Path(__file__).parents[1] / "supabase" / "migrations"
+        base_migration = (migration_path / "20260904000000_create_rh_rwa_monitor.sql").read_text(encoding="utf-8")
+        upgrade_migration = (migration_path / "20260904000004_dashboard_all_pools.sql").read_text(encoding="utf-8")
+
+        for migration in (base_migration, upgrade_migration):
+            self.assertIn("from rh_uniswap_v4_pools p", migration.lower())
+            self.assertIn("p_pool_ids is null or p.pool_id = any (p_pool_ids)", migration.lower())
+
     def test_supabase_upsert_uses_rh_table_and_idempotent_conflict(self) -> None:
         session = Mock()
         response = Mock()

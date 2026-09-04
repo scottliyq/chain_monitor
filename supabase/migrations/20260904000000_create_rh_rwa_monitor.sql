@@ -194,13 +194,10 @@ windows(window_hours) as (
     values (2::smallint), (4::smallint), (24::smallint)
 ),
 candidates as (
-    select distinct h.pool_id
-    from rh_pool_hourly_metrics h
-    cross join params
-    where h.chain_id = p_chain_id
-      and h.asset_scope = p_asset_scope
-      and h.bucket_start >= params.current_hour - interval '23 hours'
-      and (p_pool_ids is null or h.pool_id = any (p_pool_ids))
+    select p.pool_id
+    from rh_uniswap_v4_pools p
+    where p.chain_id = p_chain_id
+      and (p_pool_ids is null or p.pool_id = any (p_pool_ids))
 ),
 aggregates as (
     select
