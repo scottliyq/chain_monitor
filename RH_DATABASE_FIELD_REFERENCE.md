@@ -1,6 +1,6 @@
 # Robinhood RWA 数据库字段说明
 
-本文档对应 `supabase/migrations/20260904000000_create_rh_rwa_monitor.sql`，说明 Robinhood Chain（chain ID `4663`）RWA/Uniswap v4 监控数据库的表、字段、约束和访问方式。
+本文档对应 `supabase/migrations/20260904000000_create_rh_rwa_monitor.sql` 及后续升级 migration，说明 Robinhood Chain（chain ID `4663`）RWA/Uniswap v4 监控数据库的表、字段、约束和访问方式。
 
 ## 1. 通用约定
 
@@ -24,9 +24,10 @@
 | `token_decimals` | smallint | 否 | Token 精度，范围 `0-255`。 |
 | `status` | text | 否 | 官方资产状态；active 资产通常为 `ASSET_STATUS_ACTIVE`。 |
 | `active` | boolean | 否 | 是否仍在官方 active 清单中，默认 `true`。 |
-| `registry_order` | integer | 否 | 官方接口返回顺序；用于选择 `latest20`。 |
+| `registry_order` | integer | 否 | 官方接口返回顺序；用于追踪清单顺序变化。 |
 | `first_seen_at` | timestamptz | 否 | 本地/数据库首次发现时间。 |
 | `last_seen_at` | timestamptz | 否 | 最近一次官方清单同步时间。 |
+| `is_new_issue` | boolean | 否 | Worker 首次发现该资产后的 24 小时内为 `true`；这是发现时间标记，不等同于官方发行时间。 |
 | `updated_at` | timestamptz | 否 | 数据库记录最近更新时间。 |
 
 主键：`(chain_id, token_address)`。
@@ -80,7 +81,7 @@
 | 字段 | 类型 | 可空 | 说明 |
 | --- | --- | --- | --- |
 | `chain_id` | integer | 否 | 链 ID。 |
-| `asset_scope` | text | 否 | 分析范围，如 `latest20` 或 `all_active`。 |
+| `asset_scope` | text | 否 | 分析范围；当前 Worker 使用 `all_active`。 |
 | `pool_id` | text | 否 | 池标识。 |
 | `bucket_start` | timestamptz | 否 | UTC 小时起点，必须经过 `date_trunc('hour', ...)`。 |
 | `swap_count` | integer | 否 | 该小时 Swap 数量，默认 `0`。 |
@@ -101,7 +102,7 @@
 | 字段 | 类型 | 可空 | 说明 |
 | --- | --- | --- | --- |
 | `chain_id` | integer | 否 | 链 ID。 |
-| `asset_scope` | text | 否 | 分析范围；前端 `latest20` 查询应与 Worker 一致。 |
+| `asset_scope` | text | 否 | 分析范围；前端查询应与 Worker 使用相同的 `all_active` scope。 |
 | `pool_id` | text | 否 | 池标识。 |
 | `window_hours` | smallint | 否 | 当前仅允许 `2`、`4`、`24`。 |
 | `pool_pair` | text | 否 | 展示交易对，如 `GLXY/USDG`。 |
@@ -161,12 +162,12 @@
 
 ## 10. `rh_pool_dashboard`：前端展示兼容视图
 
-视图由 `supabase/migrations/20260904000001_create_rh_pool_dashboard_view.sql` 创建，面向截图中的池列表页面，避免前端把不同窗口的记录错误关联后显示为 0 或空值。
+视图由 `supabase/migrations/20260904000001_create_rh_pool_dashboard_view.sql` 创建，并由后续 migration 更新，面向截图中的池列表页面，避免前端把不同窗口的记录错误关联后显示为 0 或空值。
 
 | 字段 | 来源/类型 | 说明 |
 | --- | --- | --- |
 | `chain_id` | integer | 链 ID。 |
-| `asset_scope` | text | 分析范围，如 `latest20`。 |
+| `asset_scope` | text | 分析范围；当前 Worker 使用 `all_active`，表示全量 active 股票。 |
 | `pool_id` | text | v4 bytes32 池标识。 |
 | `token` | text | 池内 RWA 符号，来自 `rwa_symbols`。 |
 | `pool_address` | text | 与 `pool_id` 相同，供页面展示。 |
@@ -178,6 +179,8 @@
 | `apr_2h` | numeric | 与 `current_apr` 相同，为 2h `annualized_yield_percent`。 |
 | `rank_2h` | integer | 在相同 `chain_id`、`asset_scope` 内按 2h 年化收益率降序生成的行号。 |
 | `rank_24h` | integer | 在相同 `chain_id`、`asset_scope` 内按 24h 年化收益率降序生成的行号；页面的“24h rank”使用此字段。 |
+| `is_new_issue` | boolean | 池内任一 active RWA 股票在首次发现后 24 小时内时为 `true`，供前端筛选新发行股票对应的池。 |
+| `new_issue_discovered_at` | timestamptz | 池内新发行标记对应的最早 `first_seen_at`；无新发行股票时为空。 |
 | `metric_time` | timestamptz | 优先使用 24h 排名计算时间，缺失时回退 2h 排名计算时间。 |
 | `sync_time` | timestamptz | `rh_sync_checkpoints.last_success_at`，表示 Worker 最近一次成功写入时间。 |
 | `swap_count_2h` / `swap_count_24h` | integer | 两个窗口的 Swap 数量。 |
@@ -191,18 +194,21 @@
 ```typescript
 const { data, error } = await supabase
   .from("rh_pool_dashboard")
-  .select("token,pool_address,pool,tvl_usd,volume_24h_usd,fee_apr,current_apr,apr_2h,rank_2h,rank_24h,metric_time,sync_time")
+  .select("token,pool_address,pool,tvl_usd,volume_24h_usd,fee_apr,current_apr,apr_2h,rank_2h,rank_24h,is_new_issue,new_issue_discovered_at,metric_time,sync_time")
   .eq("chain_id", 4663)
-  .eq("asset_scope", "latest20")
+  .eq("asset_scope", "all_active")
+  .eq("is_new_issue", true)
   .order("rank_24h", { ascending: true })
   .limit(10);
 ```
 
-若页面只需要官方排名原始字段，继续查询 `rh_pool_window_rankings`；若需要池列表页面的 TVL、24h 成交量、两个 APR 和同步时间，使用本视图。
+该查询只返回池内存在 24 小时内新发行股票的池；若页面需要完整全量池列表，去掉
+`.eq("is_new_issue", true)` 即可。若页面只需要官方排名原始字段，继续查询
+`rh_pool_window_rankings`；若需要池列表页面的 TVL、24h 成交量、两个 APR、同步时间和新发行标记，使用本视图。
 
 ## 11. 字段取值检查
 
-检查时间：2026-09-04 05:02 UTC；链 ID：`4663`；范围：`latest20`。当前基础表检查结果如下：
+检查时间：2026-09-04 05:02 UTC；链 ID：`4663`；范围：`all_active`。当前基础表检查结果如下：
 
 | 页面字段 | 数据库取值/样例 | 状态 |
 | --- | --- | --- |

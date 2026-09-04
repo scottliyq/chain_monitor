@@ -15,6 +15,7 @@ create table if not exists public.rh_rwa_assets (
     registry_order integer not null default 0 check (registry_order >= 0),
     first_seen_at timestamptz not null,
     last_seen_at timestamptz not null,
+    is_new_issue boolean not null default false,
     updated_at timestamptz not null default now(),
     primary key (chain_id, token_address)
 );
