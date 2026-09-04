@@ -32,6 +32,12 @@ NETWORK_CONFIGS = {
         "native_token": "BNB",
         "block_time": 3,
     },
+    "robinhood": {
+        "name": "Robinhood Chain",
+        "chain_id": 4663,
+        "native_token": "ETH",
+        "block_time": 0.1,
+    },
 }
 
 API_CONFIGS = {
@@ -55,6 +61,11 @@ API_CONFIGS = {
         "api_key_env": "BSCSCAN_API_KEY",
         "chain_id": 56,
     },
+    "robinhood": {
+        "base_url": "https://robinhoodchain.blockscout.com/api",
+        "api_key_env": "ROBINHOOD_BLOCKSCOUT_API_KEY",
+        "chain_id": 4663,
+    },
 }
 
 NETWORK_RPC_ENV = {
@@ -62,6 +73,7 @@ NETWORK_RPC_ENV = {
     "arbitrum": "ARBITRUM_RPC_URL",
     "base": "BASE_RPC_URL",
     "bsc": "BSC_RPC_URL",
+    "robinhood": "ROBINHOOD_RPC_URL",
 }
 
 DEFAULT_RPCS = {
@@ -69,6 +81,7 @@ DEFAULT_RPCS = {
     "arbitrum": "https://arb1.arbitrum.io/rpc",
     "base": "https://mainnet.base.org",
     "bsc": "https://bsc-dataseed1.binance.org",
+    "robinhood": "https://rpc.mainnet.chain.robinhood.com",
 }
 
 
@@ -107,12 +120,17 @@ def get_api_config(network: str) -> dict:
     }
 
 
-def get_rpc_url(network: str, allow_default: bool = True) -> str:
+def get_rpc_url(
+    network: str,
+    allow_default: bool = True,
+    use_generic_fallback: bool = True,
+) -> str:
     """获取网络 RPC URL。
 
     Args:
         network: 网络名称
         allow_default: 是否允许回退到公共默认 RPC
+        use_generic_fallback: 是否允许回退到通用 WEB3_RPC_URL
     """
     normalized_network = network.lower()
     if normalized_network not in NETWORK_RPC_ENV:
@@ -121,7 +139,9 @@ def get_rpc_url(network: str, allow_default: bool = True) -> str:
         )
 
     rpc_env_name = NETWORK_RPC_ENV[normalized_network]
-    rpc_url = os.getenv(rpc_env_name) or os.getenv("WEB3_RPC_URL")
+    rpc_url = os.getenv(rpc_env_name)
+    if not rpc_url and use_generic_fallback:
+        rpc_url = os.getenv("WEB3_RPC_URL")
 
     if rpc_url:
         return rpc_url.strip()
