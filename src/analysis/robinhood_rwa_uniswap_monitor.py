@@ -1467,9 +1467,27 @@ def main() -> int:
                 report.get("rwa_pool_count", 0),
                 args.output,
             )
-        except (requests.RequestException, SupabaseRepositoryError, ValueError, Web3Exception, OSError) as error:
-            logger.error("RWA/Uniswap 扫描失败 [%s]: %s", type(error).__name__, error.__class__.__name__)
-            return 1
+        except (
+            requests.RequestException,
+            SupabaseRepositoryError,
+            ValueError,
+            Web3Exception,
+            OSError,
+            RuntimeError,
+        ) as error:
+            logger.exception(
+                "RWA/Uniswap 扫描失败 [%s]: %s",
+                type(error).__name__,
+                str(error) or error.__class__.__name__,
+            )
+            if args.interval_minutes <= 0:
+                return 1
+            logger.warning(
+                "本轮扫描失败，worker 将在 %s 分钟后自动重试",
+                args.interval_minutes,
+            )
+            time.sleep(args.interval_minutes * 60)
+            continue
         if args.interval_minutes <= 0:
             return 0
         time.sleep(args.interval_minutes * 60)

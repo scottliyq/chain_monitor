@@ -369,6 +369,10 @@ cron/systemd 定时执行。
 每轮都会重新获取官方 `/rhj/assets` 的全量 active 股票列表并保存到资产快照；
 池初始化事件也始终按全量 active 股票筛选，不再限制前 20 个资产。
 
+启用 `--interval-minutes` 的常驻 worker 遇到临时 HTTP/RPC、Web3、Supabase 或报告写入
+异常时，会记录 traceback，等待下一次间隔后自动重试，不会因为单轮失败退出；不带该参数的
+一次性执行仍会以失败状态返回，便于脚本或 cron 判断本次任务失败。
+
 Robinhood Chain 官方文档列出的主网 RPC 包括官方公共 RPC，以及需要账号/密钥的
 Alchemy、QuickNode、Blockdaemon、dRPC、Validation Cloud、Chainstack 和 GlobalStake。大批量历史扫描建议把
 已申请的节点放在 `ROBINHOOD_RPC_URLS` 中，用逗号分隔；程序会按请求轮询，并在

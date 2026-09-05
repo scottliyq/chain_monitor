@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Robinhood RWA/Uniswap 监控器纯函数测试。"""
 
+import argparse
 import json
 import os
 import unittest
@@ -22,6 +23,7 @@ from analysis.robinhood_rwa_uniswap_monitor import (
     calculate_virtual_reserves,
     calculate_yield_percent,
     is_new_issue,
+    main as monitor_main,
     RwaAssetRegistry,
     RobinhoodRwaUniswapMonitor,
     RwaAsset,
@@ -34,6 +36,42 @@ from core.supabase_repository import load_supabase_config
 
 
 class TestRobinhoodRwaUniswapMonitor(unittest.TestCase):
+    def test_periodic_worker_continues_after_retryable_scan_failure(self) -> None:
+        args = argparse.Namespace(
+            interval_minutes=1,
+            supabase_publish=False,
+            rpc_check_only=False,
+            rpc_url="https://rpc.example",
+            rpc_health_output=Path("rpc-health.json"),
+            assets_output=Path("assets.json"),
+            pool_cache=Path("pools.json"),
+            output=Path("report.json"),
+            csv_output=Path("report.csv"),
+            pool_start_block=0,
+            chunk_size=1_000_000,
+            native_price_usd=None,
+            all_rwa_pairs=False,
+        )
+        monitor = Mock()
+        monitor.run_once.side_effect = [
+            requests.HTTPError("temporary RPC failure"),
+            {"active_asset_count": 1, "rwa_pool_count": 1},
+        ]
+        with patch("analysis.robinhood_rwa_uniswap_monitor.load_dotenv"), patch(
+            "analysis.robinhood_rwa_uniswap_monitor._parse_args", return_value=args
+        ), patch(
+            "analysis.robinhood_rwa_uniswap_monitor.RobinhoodRwaUniswapMonitor",
+            return_value=monitor,
+        ), patch(
+            "analysis.robinhood_rwa_uniswap_monitor.time.sleep",
+            side_effect=[None, StopIteration],
+        ) as sleep:
+            with self.assertRaises(StopIteration):
+                monitor_main()
+
+        self.assertEqual(monitor.run_once.call_count, 2)
+        self.assertEqual(sleep.call_count, 2)
+
     def test_new_issue_marker_is_true_for_first_24_hours_only(self) -> None:
         now = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
 
