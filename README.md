@@ -379,8 +379,32 @@ Alchemy、QuickNode、Blockdaemon、dRPC、Validation Cloud、Chainstack 和 Glo
 429、超时、临时服务错误或 `BlockNotFound` 时切换节点。为避免不同节点链头
 不同导致区块读取失败，每一轮 `run_once()` 会固定使用一个 RPC；只有当前节点
 发生可重试故障时才切换到下一个节点。API key/token 不会写入日志或报告。
-也可以分别设置 `ALCHEMY_RPC_URL`、`TATUM_RPC_URL`、`ROBINHOOD_RPC_URL`；未传
-`--rpc-url` 时程序会收集所有已配置的这些变量并去重轮询。
+也可以分别设置 `ALCHEMY_RPC_URL`、`TATUM_RPC_URL`、`QUICKNODE_RPC_URL`、
+`BLOCKDAEMON_RPC_URL`、`DRPC_RPC_URL`、`VALIDATION_CLOUD_RPC_URL`、
+`CHAINSTACK_RPC_URL`、`GLOBALSTAKE_RPC_URL`、`ROBINHOOD_RPC_URL`；未传
+`--rpc-url` 时程序会收集所有已配置的这些变量并去重轮询。QuickNode、Blockdaemon、
+dRPC、Validation Cloud、Chainstack 和 GlobalStake 的 endpoint 需要先在对应供应商
+控制台手动注册 Robinhood Chain 主网后取得，真实地址和 API Key 只放在 `.env`，不要写入
+YAML 或提交到仓库。官方文档确认 QuickNode 的地址格式为
+`https://{ENDPOINT}.robinhood-mainnet.quiknode.pro/{TOKEN}`，其他供应商的地址以其
+控制台生成结果为准。
+
+`.env` 配置示例（仅示意，需替换为你注册后获得的真实地址）：
+
+```dotenv
+ROBINHOOD_RPC_URLS=https://rpc.mainnet.chain.robinhood.com
+ALCHEMY_RPC_URL=https://robinhood-mainnet.g.alchemy.com/v2/<API_KEY>
+TATUM_RPC_URL=https://robinhood-mainnet.gateway.tatum.io
+QUICKNODE_RPC_URL=https://<ENDPOINT>.robinhood-mainnet.quiknode.pro/<TOKEN>
+BLOCKDAEMON_RPC_URL=
+DRPC_RPC_URL=
+VALIDATION_CLOUD_RPC_URL=
+CHAINSTACK_RPC_URL=
+GLOBALSTAKE_RPC_URL=
+```
+
+空变量会自动跳过。填写完成后可用 `--rpc-check-only` 检查每个 endpoint 的 Chain ID
+和最新区块；只有返回 Chain ID `4663` 的节点才应保留在轮询列表中。
 
 官方 RWA 价格接口遇到超时、连接错误、408、429 或 5xx 临时错误时，会按 1 秒、
 2 秒退避，最多尝试 3 次；非临时 HTTP 错误不会重复请求。三次都失败时，该资产

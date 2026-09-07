@@ -368,6 +368,12 @@ class TestRobinhoodRwaUniswapMonitor(unittest.TestCase):
             {
                 "ALCHEMY_RPC_URL": "https://alchemy.example/v2/key",
                 "TATUM_RPC_URL": "https://tatum.example",
+                "QUICKNODE_RPC_URL": "https://quicknode.example/token",
+                "BLOCKDAEMON_RPC_URL": "https://blockdaemon.example",
+                "DRPC_RPC_URL": "https://drpc.example",
+                "VALIDATION_CLOUD_RPC_URL": "https://validation.example",
+                "CHAINSTACK_RPC_URL": "https://chainstack.example",
+                "GLOBALSTAKE_RPC_URL": "https://globalstake.example",
             },
             clear=True,
         ):
@@ -376,6 +382,12 @@ class TestRobinhoodRwaUniswapMonitor(unittest.TestCase):
                 (
                     "https://alchemy.example/v2/key",
                     "https://tatum.example",
+                    "https://quicknode.example/token",
+                    "https://blockdaemon.example",
+                    "https://drpc.example",
+                    "https://validation.example",
+                    "https://chainstack.example",
+                    "https://globalstake.example",
                     "https://rpc.mainnet.chain.robinhood.com",
                 ),
             )
