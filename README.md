@@ -366,8 +366,26 @@ python src/robinhood_rwa_uniswap_monitor.py \
 `last_scanned_block + 1` 增量更新。可使用 `--interval-minutes 10` 持续更新，或交给
 cron/systemd 定时执行。
 
-每轮都会重新获取官方 `/rhj/assets` 的全量 active 股票列表并保存到资产快照；
-池初始化事件也始终按全量 active 股票筛选，不再限制前 20 个资产。
+资产清单采用“每日一次全量同步、其余轮次读取本地快照”的策略。全量同步会读取官方
+`/rhj/assets`，再读取每个 active 股票的 `/rhj/prices/{symbol}` 中的
+`dailyTradingVolume`，并把结果保存到资产快照。`currentMultiplier`（每个 token 当前可赎回的
+underlying shares 数量）保存为 `current_multiplier`。`/prices` 返回的是未乘 multiplier 的
+underlying raw price，监控器会在计算手续费和池规模 proxy 前乘上当前 multiplier，因此 1 token
+可赎回 1.01 股时按 1.01 股计价。
+也可以只查询指定股票的 multiplier：
+
+```python
+from analysis.robinhood_rwa_uniswap_monitor import RwaAssetRegistry
+
+registry = RwaAssetRegistry()
+print(registry.fetch_multipliers(["NVDA"]))
+# {"NVDA": Decimal("1.01...")}
+```
+
+每日全量同步后，Worker 将“本次新发现的资产 + `dailyTradingVolume` 最低的 30 个资产”去重后
+保存为后续扫描列表。每 10 分钟运行时只用该列表筛选池和扫描 Swap，不再用全量 active 股票
+反复检索。首次建立快照时不会把全部历史资产误判为新增资产，只使用交易量最低的 30 个资产。
+候选列表的 `asset_scope` 为 `daily_candidates`。
 
 启用 `--interval-minutes` 的常驻 worker 遇到临时 HTTP/RPC、Web3、Supabase 或报告写入
 异常时，会记录 traceback，等待下一次间隔后自动重试，不会因为单轮失败退出；不带该参数的
@@ -429,20 +447,23 @@ v4 池没有独立池合约地址，实际交互合约是 PoolManager。
 
 资产首次出现在本地快照时记录 `first_seen_at`；首次发现后的 24 小时内，资产会标记
 `is_new_issue=true`。这表示 Worker 首次观察到该资产的时间，不等同于官方证券发行时间。
-报告中的 `assets` 保存全量 active 股票及其标记，`new_issue_symbols` 提供本轮新发行股票。
+`is_new_asset=true` 表示该资产在最近一次每日全量同步中相对于历史快照是新增资产。
+报告中的 `assets` 保存全量 active 股票及其标记，`asset_selection` 保存候选列表、全量同步时间、
+新增资产和低交易量资产摘要。
 
 ### 5.8 Supabase 小时级存储与前端直查
 
 Supabase migration 位于 `supabase/migrations/20260904000000_create_rh_rwa_monitor.sql`，
 所有 Robinhood 相关数据库对象使用 `rh_` 前缀：
 
-- `rh_rwa_assets`：官方 RWA 全量资产清单，包含 `first_seen_at` 和 `is_new_issue`。
+- `rh_rwa_assets`：官方 RWA 全量资产清单，包含 `first_seen_at`、`is_new_issue`、`is_new_asset`、
+  `daily_trading_volume`、候选标记和最新的 `current_multiplier`。
 - `rh_uniswap_v4_pools`：Uniswap v4 池元数据。
 - `rh_uniswap_v4_swap_events`：最近 7 天去重后的 Swap 事件。
 - `rh_pool_hourly_metrics`：按池和 UTC 小时保存手续费、Swap 数量和池规模 proxy。
 - `rh_pool_window_rankings`：预计算的 2h、4h、24h 当前窗口收益排名。
 - `rh_sync_checkpoints`：Initialize/Swap 增量扫描进度。
-- `rh_pool_dashboard`：面向前端展示的兼容视图，提供 `tvl_usd`、`volume_24h_usd`、`fee_apr`、`apr_2h`、`rank_2h`、`metric_time`、`sync_time`、`is_new_issue` 和 `new_issue_discovered_at`。
+- `rh_pool_dashboard`：面向前端展示的兼容视图，提供 `pool_type`、`tvl_usd`、`volume_24h_usd`、`fee_apr`、`apr_2h`、`rank_2h`、`metric_time`、`sync_time`、`is_new_issue` 和 `new_issue_discovered_at`。
 
 启用 Supabase 发布前，在 `.env` 中设置 `SUPABASE_URL` 和
 `SUPABASE_SERVICE_ROLE_KEY`（或新版项目的 `SUPABASE_SECRET_KEY`），然后在 Supabase SQL Editor 执行 migration。Worker
@@ -470,7 +491,7 @@ const { data, error } = await supabase
   .from("rh_pool_window_rankings")
   .select("window_hours,pool_pair,pool_address,swap_count,fee_income_usd,pool_size_usd_proxy,window_yield_percent,annualized_yield_percent,data_quality,computed_at")
   .eq("chain_id", 4663)
-  .eq("asset_scope", "all_active")
+  .eq("asset_scope", "daily_candidates")
   .eq("window_hours", 24)
   .order("annualized_yield_percent", { ascending: false })
   .limit(10);
@@ -486,19 +507,23 @@ const { data, error } = await supabase
 ```typescript
 const { data, error } = await supabase
   .from("rh_pool_dashboard")
-  .select("token,pool_address,pool,tvl_usd,volume_24h_usd,fee_apr,current_apr,apr_2h,rank_2h,rank_24h,is_new_issue,new_issue_discovered_at,metric_time,sync_time")
+  .select("token,pool_address,pool,pool_type,tvl_usd,volume_24h_usd,fee_apr,current_apr,apr_2h,rank_2h,rank_24h,is_new_issue,new_issue_discovered_at,metric_time,sync_time")
   .eq("chain_id", 4663)
-  .eq("asset_scope", "all_active")
+  .eq("asset_scope", "daily_candidates")
   .order("rank_24h", { ascending: true });
 ```
 
 `rh_pool_dashboard` 的首次 migration 为
 `supabase/migrations/20260904000001_create_rh_pool_dashboard_view.sql`；如果该文件已经执行，需继续执行
 `supabase/migrations/20260904000002_fix_rh_pool_dashboard_division.sql` 修复零费率 Swap 的除零问题，
-已有数据库还需执行 `supabase/migrations/20260904000003_add_new_issue_tracking.sql` 增加新发行字段，
-以及 `supabase/migrations/20260904000004_dashboard_all_pools.sql` 让 dashboard 包含全部已发现池。其中
+已有数据库还需执行 `supabase/migrations/20260904000003_add_new_issue_tracking.sql` 增加新发行字段、
+`supabase/migrations/20260904000004_dashboard_all_pools.sql` 让 dashboard 包含全部已发现池，及
+`supabase/migrations/20260907000000_add_multiplier_to_rh_rwa_assets.sql` 增加资产 multiplier 字段，
+`supabase/migrations/20260907000002_add_rh_asset_selection.sql` 增加每日交易量和候选资产字段，
+`supabase/migrations/20260907000003_add_pool_type_to_dashboard.sql` 增加 `pool_type` 字段。其中
 `fee_apr` 是 24h 线性年化收益率，`apr_2h` 是 2h 线性年化收益率，
 `volume_24h_usd` 根据最近 24h Swap 的手续费和实际 fee pips 反推输入量 USD；缺少价格或费率时返回 `null`，不伪造为 0。
+当前 `pool_type` 为 `v4`；前端应直接展示该字段，不要根据池名称猜测协议版本。
 
 #### 5.8.1 数据库字段说明
 
@@ -507,6 +532,15 @@ const { data, error } = await supabase
 该文档与 `supabase/migrations/20260904000000_create_rh_rwa_monitor.sql` 对照维护；`pool_address` 仍表示 Uniswap v4 的 bytes32 `pool_id`。
 
 ## 6. 本次更新记录
+
+### 2026-09-08
+
+- 修复资产快照中缺少最新日交易量时，将 `volume_updated_at` 写成字符串 `"None"` 导致 Supabase `rh_rwa_assets` 批量 upsert 返回 HTTP 400 的问题；现在正确写入 SQL `NULL`。
+- Supabase 写入异常会保留截断后的响应正文，便于定位字段和约束错误，同时不会输出连接密钥。
+
+修改原因：
+
+- 部分股票报价接口临时失败时，日交易量时间应保持为空，不能把 Python 的 `None` 字符串化后写入 `timestamptz` 字段；该错误会使整批资产更新失败并造成前端数据滞后。
 
 ### 2026-04-25
 
@@ -535,10 +569,24 @@ const { data, error } = await supabase
 
 - 用户需要持续确认 NVDA3L 的 mint cap 是否提高，并在 cap 变化时获得通知；合约未提供标准 cap 查询函数，只能复用现有只读 mint 模拟结果提取 cap。
 
+### 2026-09-07
+
+- 从官方 `/rhj/assets` 读取每个 Stock Token 的 `currentMultiplier`，新增 `RwaAssetRegistry.fetch_multipliers()` 查询指定股票的当前 multiplier；资产快照和 Supabase 的 `rh_rwa_assets.current_multiplier` 均保存最新值。
+- 估值使用 underlying raw price × current multiplier，反映 Robinhood 通过 multiplier 处理现金分红和其他 corporate action 的 shares-per-token 规则。
+- 新增 `supabase/migrations/20260907000000_add_multiplier_to_rh_rwa_assets.sql`，用于已有数据库增加 multiplier 字段。
+- 新增 `supabase/migrations/20260907000001_create_rh_asset_multiplier_view.sql`，为前端提供 active 股票 multiplier 的公开只读视图，避免暴露 service role key。
+- 改为每日一次全量同步官方资产和日交易量，其余 Worker 轮次读取本地快照。
+- 后续 RPC 扫描列表改为“每日新增资产 + 日交易量最低 30 个资产”，并使用 `daily_candidates` 作为数据库分析范围。
+- 新增 `supabase/migrations/20260907000002_add_rh_asset_selection.sql`，保存日交易量、候选原因、候选排名和新增资产标记。
+
+修改原因：
+
+- Robinhood Stock Token 的分红不直接向用户发放 token，而是提高每个 token 可赎回的真实股票数量；监控器需要同时查询、持久化并正确使用该 multiplier。
+- 全量扫描所有 active 股票会带来较高的 RPC `get_logs` 成本；使用新增资产和低交易量资产候选集可以降低持续扫描压力，同时保留每日全量发现能力。
+
 ### 2026-09-04
 
-- Worker 每轮保存官方 `/rhj/assets` 全量 active 股票列表，使用 `first_seen_at` 记录首次发现时间，并在 24 小时内输出 `is_new_issue=true`。
-- Uniswap v4 池初始化扫描改为使用全量 active 股票，不再按前 20 个资产筛选；本地报告增加全量 `assets` 和新发行股票摘要。
+- Worker 保存官方 `/rhj/assets` 全量 active 股票列表，使用 `first_seen_at` 记录首次发现时间，并在 24 小时内输出 `is_new_issue=true`。
 - `rh_pool_dashboard` 增加 `is_new_issue` 和 `new_issue_discovered_at`，前端可直接筛选 24 小时内新发行股票对应的池。
 - 新增 `supabase/migrations/20260904000003_add_new_issue_tracking.sql`，用于已有数据库升级。
 - 新增 `supabase/migrations/20260904000004_dashboard_all_pools.sql`，使 dashboard 包含全量已发现股票池；无近期 Swap 的池仍保留，收益指标显示为 `null` 或 `partial`。

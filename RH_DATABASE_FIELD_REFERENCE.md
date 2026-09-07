@@ -22,15 +22,77 @@
 | `token_name` | text | 否 | 官方资产名称。 |
 | `isin` | text | 是 | 证券 ISIN；官方未提供时为空。 |
 | `token_decimals` | smallint | 否 | Token 精度，范围 `0-255`。 |
+| `current_multiplier` | numeric(38,18) | 是 | Robinhood 官方 `currentMultiplier`；当前 1 个 token 可赎回的 underlying 股票数量。现金分红等 corporate action 通过该 shares-per-token multiplier 体现。 |
 | `status` | text | 否 | 官方资产状态；active 资产通常为 `ASSET_STATUS_ACTIVE`。 |
 | `active` | boolean | 否 | 是否仍在官方 active 清单中，默认 `true`。 |
 | `registry_order` | integer | 否 | 官方接口返回顺序；用于追踪清单顺序变化。 |
 | `first_seen_at` | timestamptz | 否 | 本地/数据库首次发现时间。 |
 | `last_seen_at` | timestamptz | 否 | 最近一次官方清单同步时间。 |
 | `is_new_issue` | boolean | 否 | Worker 首次发现该资产后的 24 小时内为 `true`；这是发现时间标记，不等同于官方发行时间。 |
+| `daily_trading_volume` | numeric(78,18) | 是 | Robinhood `/rhj/prices/{symbol}` 返回的 underlying 日交易量；每日全量同步时更新，缺失时为空。 |
+| `volume_updated_at` | timestamptz | 是 | `daily_trading_volume` 最近一次成功更新的 UTC 时间。 |
+| `is_new_asset` | boolean | 否 | 最近一次每日全量同步中，相对于历史资产快照首次出现的资产标记。初始建立快照时不把全部历史资产标记为新增。 |
+| `monitoring_selected` | boolean | 否 | 是否进入后续 RPC 扫描候选列表；候选由新增资产和日交易量最低 30 个资产组成。 |
+| `monitoring_reason` | text | 是 | 候选原因：`new_asset`、`low_volume` 或 `new_asset+low_volume`。未入选时为空。 |
+| `monitoring_rank` | integer | 是 | 在日交易量最低候选中的排名，从 `1` 开始；仅新增但不属于低交易量候选时为空。 |
 | `updated_at` | timestamptz | 否 | 数据库记录最近更新时间。 |
 
 主键：`(chain_id, token_address)`。
+
+Worker 每日从 `GET https://api.robinhood.com/rhj/assets` 读取全量资产和 `dailyTradingVolume` 并 upsert；
+其他轮次直接读取本地资产快照，仅使用 `monitoring_selected=true` 的候选资产扫描池和 Swap。
+`NULL` 表示官方接口缺少或返回了无效值。需要直接查询指定股票时，可调用
+`RwaAssetRegistry.fetch_multipliers(["NVDA"])`，返回 `dict[str, Decimal]`。
+
+### 前端展示 multiplier
+
+前端不要使用 service role key 直接查询 `rh_rwa_assets`。执行
+`supabase/migrations/20260907000001_create_rh_asset_multiplier_view.sql` 后，使用公开只读视图
+`rh_asset_multiplier_dashboard`：
+
+```typescript
+const { data, error } = await supabase
+  .from("rh_asset_multiplier_dashboard")
+  .select("token_symbol,token_name,token_address,current_multiplier,updated_at")
+  .eq("chain_id", 4663)
+  .order("token_symbol", { ascending: true });
+```
+
+页面应同时展示股票符号、`current_multiplier` 和 `updated_at`，并将 `null` 显示为 `—`。该字段
+单位是 underlying shares/token：例如 `1.010000000000000000` 表示 1 个 Stock Token 当前
+可赎回 1.01 股 underlying 股票。Supabase 对 `numeric` 字段可能返回字符串，前端应按字符串展示，
+不要先转成 JavaScript `number` 造成 18 位小数精度损失：
+
+```typescript
+type AssetMultiplier = {
+  token_symbol: string;
+  token_name: string;
+  token_address: string;
+  current_multiplier: string | null;
+  updated_at: string;
+};
+
+function formatMultiplier(value: string | null): string {
+  if (value === null || value === "") return "—";
+  return value.includes(".")
+    ? value.replace(/0+$/, "").replace(/\.$/, "")
+    : value;
+}
+
+function MultiplierTable({ rows }: { rows: AssetMultiplier[] }) {
+  return rows.map((row) => (
+    <tr key={row.token_address}>
+      <td>{row.token_symbol}</td>
+      <td>{formatMultiplier(row.current_multiplier)}</td>
+      <td>{new Date(row.updated_at).toLocaleString()}</td>
+    </tr>
+  ));
+}
+```
+
+视图只返回 active 资产的公开展示字段；service role key 仍只用于 Worker upsert。`current_multiplier`
+表示当前已经生效的值，不是 `pendingMultiplier`；如果需要展示待生效 corporate action，应另行扩展
+资产同步字段和公开视图。
 
 ## 3. `rh_uniswap_v4_pools`：池元数据
 
@@ -81,7 +143,7 @@
 | 字段 | 类型 | 可空 | 说明 |
 | --- | --- | --- | --- |
 | `chain_id` | integer | 否 | 链 ID。 |
-| `asset_scope` | text | 否 | 分析范围；当前 Worker 使用 `all_active`。 |
+| `asset_scope` | text | 否 | 分析范围；当前 Worker 使用 `daily_candidates`，表示每日新增资产与日交易量最低 30 个资产。 |
 | `pool_id` | text | 否 | 池标识。 |
 | `bucket_start` | timestamptz | 否 | UTC 小时起点，必须经过 `date_trunc('hour', ...)`。 |
 | `swap_count` | integer | 否 | 该小时 Swap 数量，默认 `0`。 |
@@ -102,7 +164,7 @@
 | 字段 | 类型 | 可空 | 说明 |
 | --- | --- | --- | --- |
 | `chain_id` | integer | 否 | 链 ID。 |
-| `asset_scope` | text | 否 | 分析范围；前端查询应与 Worker 使用相同的 `all_active` scope。 |
+| `asset_scope` | text | 否 | 分析范围；前端查询应与 Worker 使用相同的 `daily_candidates` scope。 |
 | `pool_id` | text | 否 | 池标识。 |
 | `window_hours` | smallint | 否 | 当前仅允许 `2`、`4`、`24`。 |
 | `pool_pair` | text | 否 | 展示交易对，如 `GLXY/USDG`。 |
@@ -167,11 +229,12 @@
 | 字段 | 来源/类型 | 说明 |
 | --- | --- | --- |
 | `chain_id` | integer | 链 ID。 |
-| `asset_scope` | text | 分析范围；当前 Worker 使用 `all_active`，表示全量 active 股票。 |
+| `asset_scope` | text | 分析范围；当前 Worker 使用 `daily_candidates`，表示每日新增资产与日交易量最低 30 个资产。 |
 | `pool_id` | text | v4 bytes32 池标识。 |
 | `token` | text | 池内 RWA 符号，来自 `rwa_symbols`。 |
 | `pool_address` | text | 与 `pool_id` 相同，供页面展示。 |
 | `pool` | text | 交易对，如 `SPCX/USDG`。 |
+| `pool_type` | text | 池子协议类型；当前池注册表全部来自 Uniswap v4，因此固定为 `v4`。未来接入 v3 时由对应数据源提供 `v3`。 |
 | `tvl_usd` | numeric | 优先使用 24h 窗口池规模，缺失时回退 2h；实际含义为 USD proxy。 |
 | `volume_24h_usd` | numeric | 最近 24h Swap 输入量 USD 估算；缺价格或存在 `fee_pips <= 0` 的事件时为 `null`，SQL 使用 `NULLIF(fee_pips, 0)` 防止除零。 |
 | `fee_apr` | numeric | 24h `annualized_yield_percent`，线性年化；页面的“24h 年化收益率”使用此字段。 |
@@ -194,19 +257,19 @@
 ```typescript
 const { data, error } = await supabase
   .from("rh_pool_dashboard")
-  .select("token,pool_address,pool,tvl_usd,volume_24h_usd,fee_apr,current_apr,apr_2h,rank_2h,rank_24h,is_new_issue,new_issue_discovered_at,metric_time,sync_time")
+  .select("token,pool_address,pool,pool_type,tvl_usd,volume_24h_usd,fee_apr,current_apr,apr_2h,rank_2h,rank_24h,is_new_issue,new_issue_discovered_at,metric_time,sync_time")
   .eq("chain_id", 4663)
-  .eq("asset_scope", "all_active")
+  .eq("asset_scope", "daily_candidates")
   .order("rank_24h", { ascending: true });
 ```
 
-该查询返回 `all_active` 范围内的全部已发现池；前端可根据 `is_new_issue`、股票名称、排序和分页自行过滤。
+该查询返回 `daily_candidates` 范围内的候选资产池；前端可根据 `is_new_issue`、股票名称、排序和分页自行过滤。
 没有近期 Swap 的池，其收益指标可能为 `null`，但仍会保留在 dashboard 中。若页面只需要官方排名原始字段，继续查询
 `rh_pool_window_rankings`；若需要池列表页面的 TVL、24h 成交量、两个 APR、同步时间和新发行标记，使用本视图。
 
 ## 11. 字段取值检查
 
-检查时间：2026-09-04 05:02 UTC；链 ID：`4663`；范围：`all_active`。当前基础表检查结果如下：
+检查时间：2026-09-04 05:02 UTC；链 ID：`4663`；范围：`daily_candidates`。当前基础表检查结果如下：
 
 | 页面字段 | 数据库取值/样例 | 状态 |
 | --- | --- | --- |
@@ -238,7 +301,12 @@ supabase/migrations/20260904000002_fix_rh_pool_dashboard_division.sql
 ```text
 supabase/migrations/20260904000003_add_new_issue_tracking.sql
 supabase/migrations/20260904000004_dashboard_all_pools.sql
+supabase/migrations/20260907000000_add_multiplier_to_rh_rwa_assets.sql
+supabase/migrations/20260907000001_create_rh_asset_multiplier_view.sql
+supabase/migrations/20260907000002_add_rh_asset_selection.sql
 ```
 
-其中 `00004` 将窗口排名的候选池来源从“有小时 Swap 指标的池”改为“全量已发现池”，
-因此没有近期 Swap 的池也会显示，但收益指标保持 `null` 或 `partial`。
+其中 `20260904000004` 将窗口排名的候选池来源从“有小时 Swap 指标的池”改为“全量已发现池”，
+因此没有近期 Swap 的池也会显示，但收益指标保持 `null` 或 `partial`；
+`20260907000000` 增加资产最新 multiplier 字段，`20260907000001` 创建供前端读取的 active
+资产 multiplier 只读视图，`20260907000002` 保存每日交易量和后续 RPC 候选列表字段。

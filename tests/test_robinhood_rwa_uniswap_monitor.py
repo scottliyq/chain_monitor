@@ -22,6 +22,7 @@ from analysis.robinhood_rwa_uniswap_monitor import (
     annualize_yield_percent,
     calculate_virtual_reserves,
     calculate_yield_percent,
+    build_monitoring_asset_selection,
     is_new_issue,
     main as monitor_main,
     RwaAssetRegistry,
@@ -31,7 +32,7 @@ from analysis.robinhood_rwa_uniswap_monitor import (
 )
 from analysis.uniswap_v4_fee_analyzer import PoolMetadata
 from core.rpc_pool import RotatingHTTPProvider, mask_rpc_url, parse_rpc_urls
-from core.supabase_repository import SupabaseConfig, SupabaseRepository
+from core.supabase_repository import SupabaseConfig, SupabaseRepository, SupabaseRepositoryError
 from core.supabase_repository import load_supabase_config
 
 
@@ -87,6 +88,7 @@ class TestRobinhoodRwaUniswapMonitor(unittest.TestCase):
                     "tokenSymbol": "NEW",
                     "tokenName": "New",
                     "tokenDecimals": 18,
+                    "currentMultiplier": "1.010000000000000000",
                     "status": "ASSET_STATUS_ACTIVE",
                     "isin": "NEW-ISIN",
                     "deployments": [{"chainId": 4663, "contractAddress": "0x" + "11" * 20}],
@@ -122,6 +124,89 @@ class TestRobinhoodRwaUniswapMonitor(unittest.TestCase):
             )
             self.assertEqual(snapshot["assets"][0]["first_seen_at"], "2026-09-04T12:00:00+00:00")
             self.assertTrue(snapshot["assets"][0]["is_new_issue"])
+            self.assertEqual(snapshot["assets"][0]["current_multiplier"], "1.010000000000000000")
+            self.assertIsNone(snapshot["assets"][0]["volume_updated_at"])
+
+    def test_registry_queries_current_multipliers_by_symbol(self) -> None:
+        session = Mock()
+        response = Mock()
+        response.json.return_value = {
+            "assets": [
+                {"tokenSymbol": "NVDA", "currentMultiplier": "1.01"},
+                {"tokenSymbol": "AAPL", "currentMultiplier": "1"},
+                {"tokenSymbol": "BROKEN", "currentMultiplier": "not-a-number"},
+            ]
+        }
+        session.get.return_value = response
+
+        registry = RwaAssetRegistry(session=session)
+
+        self.assertEqual(
+            registry.fetch_multipliers(["nvda", "MISSING"]),
+            {"NVDA": Decimal("1.01")},
+        )
+        session.get.assert_called_once_with(
+            "https://api.robinhood.com/rhj/assets",
+            timeout=30,
+        )
+
+    def test_monitoring_selection_combines_new_assets_and_low_volume_assets(self) -> None:
+        assets = [
+            RwaAsset("NEW", "New", "0x" + "11" * 20, None, 18, "ACTIVE", "", "", True, 0, daily_trading_volume="100", is_new_asset=True),
+            RwaAsset("LOW1", "Low 1", "0x" + "22" * 20, None, 18, "ACTIVE", "", "", True, 1, daily_trading_volume="1"),
+            RwaAsset("LOW2", "Low 2", "0x" + "33" * 20, None, 18, "ACTIVE", "", "", True, 2, daily_trading_volume="2"),
+            RwaAsset("HIGH", "High", "0x" + "44" * 20, None, 18, "ACTIVE", "", "", True, 3, daily_trading_volume="1000"),
+        ]
+
+        selected, new_assets, low_volume_assets = build_monitoring_asset_selection(assets, low_volume_limit=2)
+
+        self.assertEqual([asset.token_symbol for asset in selected], ["NEW", "LOW1", "LOW2"])
+        self.assertEqual([asset.token_symbol for asset in new_assets], ["NEW"])
+        self.assertEqual([asset.token_symbol for asset in low_volume_assets], ["LOW1", "LOW2"])
+        self.assertEqual(selected[0].monitoring_reason, "new_asset")
+        self.assertEqual(selected[1].monitoring_reason, "low_volume")
+
+    def test_registry_uses_daily_snapshot_without_repeating_full_api_queries(self) -> None:
+        session = Mock()
+        assets_response = Mock()
+        assets_response.json.return_value = {
+            "assets": [
+                {
+                    "tokenSymbol": "LOW",
+                    "tokenName": "Low",
+                    "status": "ASSET_STATUS_ACTIVE",
+                    "deployments": [{"chainId": 4663, "contractAddress": "0x" + "11" * 20}],
+                },
+                {
+                    "tokenSymbol": "HIGH",
+                    "tokenName": "High",
+                    "status": "ASSET_STATUS_ACTIVE",
+                    "deployments": [{"chainId": 4663, "contractAddress": "0x" + "22" * 20}],
+                },
+            ]
+        }
+        low_volume_response = Mock()
+        low_volume_response.json.return_value = {"quotes": [{"dailyTradingVolume": "1"}]}
+        high_volume_response = Mock()
+        high_volume_response.json.return_value = {"quotes": [{"dailyTradingVolume": "100"}]}
+        session.get.side_effect = [assets_response, high_volume_response, low_volume_response]
+
+        with TemporaryDirectory() as directory:
+            registry = RwaAssetRegistry(
+                output_path=Path(directory) / "assets.json",
+                session=session,
+                low_volume_limit=1,
+            )
+            with patch(
+                "analysis.robinhood_rwa_uniswap_monitor._utc_now",
+                side_effect=["2026-09-04T12:00:00+00:00", "2026-09-04T12:10:00+00:00"],
+            ):
+                first = registry.sync()
+                second = registry.sync()
+
+            self.assertEqual(session.get.call_count, 3)
+            self.assertEqual([asset.token_symbol for asset in registry.get_monitoring_assets(first)], ["LOW"])
+            self.assertEqual([asset.token_symbol for asset in registry.get_monitoring_assets(second)], ["LOW"])
 
     def test_window_ranking_exposes_pool_address_column(self) -> None:
         self.assertIn("pool_address", WindowRanking.__dataclass_fields__)
@@ -143,6 +228,27 @@ class TestRobinhoodRwaUniswapMonitor(unittest.TestCase):
         )
         self.assertEqual(rows[0]["pool_address"], "0x" + "11" * 32)
         self.assertEqual(rows[0]["active_liquidity_usd_proxy"], "100.25")
+
+    def test_token_prices_apply_current_multiplier(self) -> None:
+        asset = RwaAsset(
+            "NVDA",
+            "NVIDIA",
+            "0x" + "11" * 20,
+            None,
+            18,
+            "ASSET_STATUS_ACTIVE",
+            "",
+            "",
+            True,
+            current_multiplier="1.01",
+        )
+
+        prices = RobinhoodRwaUniswapMonitor._apply_current_multipliers(
+            {"NVDA": Decimal("100"), "USDG": Decimal("1")},
+            [asset],
+        )
+
+        self.assertEqual(prices, {"NVDA": Decimal("101.00"), "USDG": Decimal("1")})
 
     def test_publish_writes_assets_pools_and_reads_all_windows_from_database(self) -> None:
         supabase = Mock()
@@ -188,14 +294,15 @@ class TestRobinhoodRwaUniswapMonitor(unittest.TestCase):
         self.assertEqual(len(asset_rows), 1)
         self.assertEqual(asset_rows[0]["token_symbol"], "TEST")
         self.assertTrue(asset_rows[0]["is_new_issue"])
+        self.assertIsNone(asset_rows[0]["current_multiplier"])
         self.assertEqual(len(pool_rows), 1)
         self.assertEqual(pool_rows[0]["pool_address"], pool.pool_id)
         self.assertEqual(
             supabase.fetch_window_rankings.call_args_list,
             [
-                call(4663, "all_active", 2, limit=10_000),
-                call(4663, "all_active", 4, limit=10_000),
-                call(4663, "all_active", 24, limit=10_000),
+                call(4663, "daily_candidates", 2, limit=10_000),
+                call(4663, "daily_candidates", 4, limit=10_000),
+                call(4663, "daily_candidates", 24, limit=10_000),
             ],
         )
 
@@ -239,6 +346,33 @@ class TestRobinhoodRwaUniswapMonitor(unittest.TestCase):
         for field in ("is_new_issue", "new_issue_discovered_at"):
             self.assertIn(f" as {field}", upgrade.lower())
 
+    def test_dashboard_pool_type_migration_exposes_v4_and_volume(self) -> None:
+        migration_path = (
+            Path(__file__).parents[1]
+            / "supabase"
+            / "migrations"
+            / "20260907000003_add_pool_type_to_dashboard.sql"
+        )
+        self.assertTrue(migration_path.exists())
+        migration = migration_path.read_text(encoding="utf-8").lower()
+
+        self.assertIn("'v4' as pool_type", migration)
+        self.assertIn("volume.volume_24h_usd", migration)
+        self.assertIn("as volume_24h_usd", migration)
+
+    def test_multiplier_view_is_public_and_preserves_decimal_text(self) -> None:
+        migration_path = (
+            Path(__file__).parents[1]
+            / "supabase"
+            / "migrations"
+            / "20260907000001_create_rh_asset_multiplier_view.sql"
+        )
+        migration = migration_path.read_text(encoding="utf-8").lower()
+
+        self.assertIn("create or replace view public.rh_asset_multiplier_dashboard", migration)
+        self.assertIn("current_multiplier::text as current_multiplier", migration)
+        self.assertIn("grant select on public.rh_asset_multiplier_dashboard to anon, authenticated", migration)
+
     def test_dashboard_ranking_candidates_include_all_registered_pools(self) -> None:
         migration_path = Path(__file__).parents[1] / "supabase" / "migrations"
         base_migration = (migration_path / "20260904000000_create_rh_rwa_monitor.sql").read_text(encoding="utf-8")
@@ -271,6 +405,30 @@ class TestRobinhoodRwaUniswapMonitor(unittest.TestCase):
         self.assertEqual(request_args[1], "https://example.supabase.co/rest/v1/rh_rwa_assets")
         self.assertEqual(request["params"], {"on_conflict": "chain_id,token_address"})
         self.assertIn("resolution=merge-duplicates", request["headers"]["Prefer"])
+
+    def test_supabase_error_includes_safe_response_detail(self) -> None:
+        session = Mock()
+        response = Mock()
+        response.status_code = 400
+        response.text = '{"code":"22007","message":"invalid timestamp"}'
+        response.raise_for_status.side_effect = requests.HTTPError(response=response)
+        session.request.return_value = response
+        repository = SupabaseRepository(
+            SupabaseConfig("https://example.supabase.co", "service-role-secret"),
+            session=session,
+        )
+
+        with self.assertRaises(SupabaseRepositoryError) as error:
+            repository.upsert_assets(
+                [{
+                    "chain_id": 4663,
+                    "token_address": "0x" + "11" * 20,
+                    "token_symbol": "TEST",
+                }]
+            )
+
+        self.assertIn("invalid timestamp", str(error.exception))
+        self.assertNotIn("service-role-secret", str(error.exception))
 
     def test_supabase_fetch_rejects_unsupported_window(self) -> None:
         repository = SupabaseRepository(SupabaseConfig("https://example.supabase.co", "key"))

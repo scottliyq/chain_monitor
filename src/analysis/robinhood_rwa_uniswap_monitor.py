@@ -18,7 +18,7 @@ import csv
 import json
 import logging
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -58,6 +58,8 @@ ROBINHOOD_PRICES_URL = "https://api.robinhood.com/rhj/prices"
 PRICE_MAX_ATTEMPTS = 3
 PRICE_RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 PRICE_RETRY_DELAYS_SECONDS = (1, 2)
+ASSET_FULL_SYNC_INTERVAL = timedelta(days=1)
+LOW_VOLUME_ASSET_LIMIT = 30
 POOL_MANAGER_ADDRESS = "0x8366a39cc670b4001a1121b8f6a443a643e40951"
 STATE_VIEW_ADDRESS = "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b"
 USDG_ADDRESS = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
@@ -115,6 +117,13 @@ class RwaAsset:
     active: bool
     registry_order: int = 0
     is_new_issue: bool = False
+    current_multiplier: str | None = None
+    daily_trading_volume: str | None = None
+    volume_updated_at: str | None = None
+    is_new_asset: bool = False
+    monitoring_selected: bool = False
+    monitoring_reason: str | None = None
+    monitoring_rank: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -202,7 +211,66 @@ def _parse_decimal(value: object) -> Decimal | None:
         parsed = Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
-    return parsed if parsed > 0 else None
+    return parsed if parsed.is_finite() and parsed > 0 else None
+
+
+def _parse_non_negative_decimal(value: object) -> Decimal | None:
+    """安全解析允许为 0 的交易量。"""
+
+    if value is None or value == "":
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return parsed if parsed.is_finite() and parsed >= 0 else None
+
+
+def build_monitoring_asset_selection(
+    assets: Sequence[RwaAsset],
+    low_volume_limit: int = LOW_VOLUME_ASSET_LIMIT,
+) -> tuple[list[RwaAsset], list[RwaAsset], list[RwaAsset]]:
+    """生成“新增资产 + 日交易量最低资产”的后续扫描列表。"""
+
+    if low_volume_limit <= 0:
+        raise ValueError("low_volume_limit 必须大于 0")
+    new_assets = [asset for asset in assets if asset.is_new_asset]
+    volume_assets = [asset for asset in assets if asset.daily_trading_volume is not None]
+    low_volume_assets = sorted(
+        volume_assets,
+        key=lambda asset: (
+            Decimal(str(asset.daily_trading_volume)),
+            asset.token_symbol,
+            asset.contract_address.lower(),
+        ),
+    )[:low_volume_limit]
+
+    selected_by_address: dict[str, RwaAsset] = {}
+    for rank, asset in enumerate(low_volume_assets, start=1):
+        selected_by_address[asset.contract_address.lower()] = replace(
+            asset,
+            monitoring_selected=True,
+            monitoring_reason="low_volume",
+            monitoring_rank=rank,
+        )
+    for asset in new_assets:
+        key = asset.contract_address.lower()
+        reason = "new_asset"
+        if key in selected_by_address:
+            reason = "new_asset+low_volume"
+        selected_by_address[key] = replace(
+            asset,
+            monitoring_selected=True,
+            monitoring_reason=reason,
+            monitoring_rank=selected_by_address.get(key, asset).monitoring_rank,
+        )
+
+    selected = [
+        selected_by_address.get(asset.contract_address.lower(), asset)
+        for asset in assets
+        if asset.contract_address.lower() in selected_by_address
+    ]
+    return selected, new_assets, low_volume_assets
 
 
 def calculate_yield_percent(fee_income_usd: Decimal | None, pool_size_usd: Decimal | None) -> float | None:
@@ -288,13 +356,18 @@ class RwaAssetRegistry:
         output_path: Path = DEFAULT_ASSETS_PATH,
         session: requests.Session | None = None,
         assets_url: str = ROBINHOOD_ASSETS_URL,
+        low_volume_limit: int = LOW_VOLUME_ASSET_LIMIT,
     ) -> None:
+        if low_volume_limit <= 0:
+            raise ValueError("low_volume_limit 必须大于 0")
         self.output_path = output_path
         self.session = session or requests.Session()
         self.assets_url = assets_url
+        self.low_volume_limit = low_volume_limit
+        self._selection_summary: dict[str, object] = {}
 
-    def sync(self) -> list[RwaAsset]:
-        """拉取官方 active 资产并更新本地快照，返回当前可分析资产。"""
+    def _fetch_raw_assets(self) -> list[dict[str, Any]]:
+        """读取 Robinhood 官方资产接口的原始资产列表。"""
 
         response = self.session.get(self.assets_url, timeout=30)
         response.raise_for_status()
@@ -302,19 +375,170 @@ class RwaAssetRegistry:
         raw_assets = payload.get("assets") if isinstance(payload, dict) else None
         if not isinstance(raw_assets, list):
             raise ValueError("Robinhood assets API 返回缺少 assets 列表")
+        return [item for item in raw_assets if isinstance(item, dict)]
 
-        previous = _load_json(self.output_path, {"assets": []}).get("assets", [])
+    def fetch_multipliers(self, symbols: Iterable[str]) -> dict[str, Decimal]:
+        """查询指定 Stock Token 当前生效的 shares-per-token multiplier。"""
+
+        requested_symbols = {str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()}
+        if not requested_symbols:
+            return {}
+        multipliers: dict[str, Decimal] = {}
+        for item in self._fetch_raw_assets():
+            symbol = str(item.get("tokenSymbol", "")).strip().upper()
+            if symbol not in requested_symbols:
+                continue
+            multiplier = _parse_decimal(item.get("currentMultiplier"))
+            if multiplier is not None:
+                multipliers[symbol] = multiplier
+        return multipliers
+
+    @staticmethod
+    def _asset_from_dict(item: Mapping[str, object]) -> RwaAsset | None:
+        """从本地快照恢复资产记录。"""
+
+        address = str(item.get("contract_address", ""))
+        if not address:
+            return None
+        try:
+            decimals = int(item.get("token_decimals", 18))
+        except (TypeError, ValueError):
+            decimals = 18
+        monitoring_rank_value = item.get("monitoring_rank")
+        try:
+            monitoring_rank = int(monitoring_rank_value) if monitoring_rank_value is not None else None
+        except (TypeError, ValueError):
+            monitoring_rank = None
+        return RwaAsset(
+            token_symbol=str(item.get("token_symbol", "")),
+            token_name=str(item.get("token_name", "")),
+            contract_address=address,
+            isin=str(item["isin"]) if item.get("isin") else None,
+            token_decimals=decimals,
+            status=str(item.get("status", "")),
+            first_seen_at=str(item.get("first_seen_at", "")),
+            last_seen_at=str(item.get("last_seen_at", "")),
+            active=bool(item.get("active", True)),
+            registry_order=int(item.get("registry_order", 0)),
+            is_new_issue=bool(item.get("is_new_issue", False)),
+            current_multiplier=str(item["current_multiplier"]) if item.get("current_multiplier") is not None else None,
+            daily_trading_volume=(
+                str(item["daily_trading_volume"])
+                if item.get("daily_trading_volume") is not None
+                else None
+            ),
+            volume_updated_at=str(item["volume_updated_at"]) if item.get("volume_updated_at") else None,
+            is_new_asset=bool(item.get("is_new_asset", False)),
+            monitoring_selected=bool(item.get("monitoring_selected", False)),
+            monitoring_reason=str(item["monitoring_reason"]) if item.get("monitoring_reason") else None,
+            monitoring_rank=monitoring_rank,
+        )
+
+    @staticmethod
+    def _snapshot_time(snapshot: Mapping[str, object]) -> datetime | None:
+        """读取全量同步时间。"""
+
+        value = snapshot.get("full_sync_at")
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+    def _load_active_snapshot(self, snapshot: Mapping[str, object]) -> list[RwaAsset]:
+        """从快照加载当前 active 资产。"""
+
+        raw_assets = snapshot.get("assets", [])
+        if not isinstance(raw_assets, list):
+            return []
+        assets = [
+            asset
+            for item in raw_assets
+            if isinstance(item, dict)
+            for asset in [self._asset_from_dict(item)]
+            if asset is not None and asset.active
+        ]
+        return sorted(assets, key=lambda asset: asset.registry_order)
+
+    def _needs_full_sync(self, snapshot: Mapping[str, object], now: datetime) -> bool:
+        """判断是否到每日全量资产和交易量同步时间。"""
+
+        full_sync_at = self._snapshot_time(snapshot)
+        if full_sync_at is None or not isinstance(snapshot.get("monitoring_asset_addresses"), list):
+            return True
+        return now.astimezone(timezone.utc) - full_sync_at.astimezone(timezone.utc) >= ASSET_FULL_SYNC_INTERVAL
+
+    def _fetch_quote(self, symbol: str) -> dict[str, Any]:
+        """读取一个官方报价，包含临时 HTTP 错误重试。"""
+
+        last_error: BaseException | None = None
+        for attempt in range(PRICE_MAX_ATTEMPTS):
+            try:
+                response = self.session.get(
+                    f"{ROBINHOOD_PRICES_URL}/{symbol}",
+                    timeout=20,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                quotes = payload.get("quotes", []) if isinstance(payload, dict) else []
+                quote = quotes[0] if isinstance(quotes, list) and quotes else {}
+                return quote if isinstance(quote, dict) else {}
+            except requests.HTTPError as error:
+                last_error = error
+                status_code = error.response.status_code if error.response is not None else 0
+                if status_code not in PRICE_RETRYABLE_STATUS_CODES:
+                    break
+            except (requests.RequestException, ValueError, KeyError) as error:
+                last_error = error
+            if attempt < PRICE_MAX_ATTEMPTS - 1:
+                time.sleep(PRICE_RETRY_DELAYS_SECONDS[attempt])
+        if last_error is not None:
+            logger.warning("无法读取 RWA 报价: %s (%s)", symbol, type(last_error).__name__)
+        return {}
+
+    def fetch_daily_trading_volumes(self, symbols: Iterable[str]) -> dict[str, Decimal]:
+        """每日读取官方报价中的 underlying 日交易量。"""
+
+        volumes: dict[str, Decimal] = {}
+        for symbol in sorted({str(value).strip().upper() for value in symbols if str(value).strip()}):
+            quote = self._fetch_quote(symbol)
+            volume = _parse_non_negative_decimal(quote.get("dailyTradingVolume"))
+            if volume is not None:
+                volumes[symbol] = volume
+            else:
+                logger.warning("无法读取 RWA 日交易量，无法参与低交易量候选筛选: %s", symbol)
+        return volumes
+
+    def sync(self, force: bool = False) -> list[RwaAsset]:
+        """每日全量同步资产；其他轮次直接返回本地快照。"""
+
+        snapshot = _load_json(self.output_path, {"assets": []})
+        now = datetime.fromisoformat(_utc_now())
+        if not force and not self._needs_full_sync(snapshot, now):
+            self._selection_summary = dict(snapshot.get("asset_selection", {}))
+            return self._load_active_snapshot(snapshot)
+
+        raw_assets = self._fetch_raw_assets()
+        previous = snapshot.get("assets", [])
+        previous_records = previous if isinstance(previous, list) else []
         previous_by_address = {
             str(item.get("contract_address", "")).lower(): item
-            for item in previous
+            for item in previous_records
             if isinstance(item, dict) and item.get("contract_address")
         }
-        now = _utc_now()
-        now_datetime = datetime.fromisoformat(now)
+        is_initial_snapshot = not previous_by_address
+        now_text = now.isoformat()
+        volumes = self.fetch_daily_trading_volumes(
+            str(item.get("tokenSymbol", "")).strip().upper()
+            for item in raw_assets
+            if isinstance(item, dict) and item.get("tokenSymbol")
+        )
         current: list[RwaAsset] = []
         seen_addresses: set[str] = set()
         for registry_order, item in enumerate(raw_assets):
-            if not isinstance(item, dict) or item.get("status") != "ASSET_STATUS_ACTIVE":
+            if item.get("status") != "ASSET_STATUS_ACTIVE":
                 continue
             deployments = item.get("deployments", [])
             deployment = next(
@@ -330,29 +554,58 @@ class RwaAssetRegistry:
             address = Web3.to_checksum_address(str(deployment["contractAddress"]))
             key = address.lower()
             old = previous_by_address.get(key, {})
-            first_seen_at = str(old.get("first_seen_at") or now)
+            first_seen_at = str(old.get("first_seen_at") or now_text)
             try:
                 decimals = int(item.get("tokenDecimals", 18))
             except (TypeError, ValueError):
                 decimals = 18
-            asset = RwaAsset(
-                token_symbol=str(item.get("tokenSymbol", "")),
-                token_name=str(item.get("tokenName", "")),
-                contract_address=address,
-                isin=str(item["isin"]) if item.get("isin") else None,
-                token_decimals=decimals,
-                status=str(item.get("status", "")),
-                first_seen_at=first_seen_at,
-                last_seen_at=now,
-                active=True,
-                registry_order=registry_order,
-                is_new_issue=is_new_issue(first_seen_at, now_datetime),
+            multiplier = _parse_decimal(item.get("currentMultiplier")) or _parse_decimal(old.get("current_multiplier"))
+            symbol = str(item.get("tokenSymbol", ""))
+            volume = volumes.get(symbol.upper())
+            if volume is None:
+                volume = _parse_non_negative_decimal(old.get("daily_trading_volume"))
+            previous_volume_updated_at = old.get("volume_updated_at")
+            volume_updated_at = (
+                now_text
+                if symbol.upper() in volumes
+                else (
+                    str(previous_volume_updated_at)
+                    if previous_volume_updated_at not in (None, "")
+                    else None
+                )
             )
-            current.append(asset)
+            current.append(
+                RwaAsset(
+                    token_symbol=symbol,
+                    token_name=str(item.get("tokenName", "")),
+                    contract_address=address,
+                    isin=str(item["isin"]) if item.get("isin") else None,
+                    token_decimals=decimals,
+                    status=str(item.get("status", "")),
+                    first_seen_at=first_seen_at,
+                    last_seen_at=now_text,
+                    active=True,
+                    registry_order=registry_order,
+                    is_new_issue=is_new_issue(first_seen_at, now),
+                    current_multiplier=format(multiplier, "f") if multiplier is not None else None,
+                    daily_trading_volume=format(volume, "f") if volume is not None else None,
+                    volume_updated_at=volume_updated_at,
+                    is_new_asset=not is_initial_snapshot and key not in previous_by_address,
+                )
+            )
             seen_addresses.add(key)
 
+        selected, new_assets, low_volume_assets = build_monitoring_asset_selection(
+            current,
+            low_volume_limit=self.low_volume_limit,
+        )
+        selected_by_address = {asset.contract_address.lower(): asset for asset in selected}
+        current = [
+            selected_by_address.get(asset.contract_address.lower(), asset)
+            for asset in current
+        ]
         historical: list[dict[str, object]] = []
-        for old in previous:
+        for old in previous_records:
             if not isinstance(old, dict):
                 continue
             address = str(old.get("contract_address", "")).lower()
@@ -361,19 +614,39 @@ class RwaAssetRegistry:
                 old_copy["active"] = False
                 old_copy["status"] = "NOT_IN_CURRENT_REGISTRY"
                 old_copy["is_new_issue"] = False
+                old_copy["is_new_asset"] = False
+                old_copy["monitoring_selected"] = False
+                old_copy["monitoring_reason"] = None
+                old_copy["monitoring_rank"] = None
                 historical.append(old_copy)
 
+        self._selection_summary = {
+            "strategy": "new_assets_plus_low_daily_volume",
+            "low_volume_limit": self.low_volume_limit,
+            "full_sync_at": now_text,
+            "next_full_sync_at": (now + ASSET_FULL_SYNC_INTERVAL).isoformat(),
+            "new_asset_symbols": [asset.token_symbol for asset in new_assets],
+            "low_volume_asset_symbols": [asset.token_symbol for asset in low_volume_assets],
+            "monitoring_asset_symbols": [asset.token_symbol for asset in selected],
+            "monitoring_asset_addresses": [asset.contract_address.lower() for asset in selected],
+        }
         records = [asset.to_dict() for asset in current] + historical
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self.output_path.write_text(
             json.dumps(
                 {
-                    "updated_at": now,
+                    "updated_at": now_text,
+                    "full_sync_at": now_text,
+                    "next_full_sync_at": self._selection_summary["next_full_sync_at"],
                     "chain_id": ROBINHOOD_CHAIN_ID,
                     "source": self.assets_url,
                     "active_asset_count": len(current),
                     "new_issue_count": sum(asset.is_new_issue for asset in current),
                     "new_issue_symbols": [asset.token_symbol for asset in current if asset.is_new_issue],
+                    "new_asset_count": len(new_assets),
+                    "new_asset_symbols": self._selection_summary["new_asset_symbols"],
+                    "monitoring_asset_addresses": self._selection_summary["monitoring_asset_addresses"],
+                    "asset_selection": self._selection_summary,
                     "assets": records,
                 },
                 ensure_ascii=False,
@@ -383,45 +656,30 @@ class RwaAssetRegistry:
         )
         return sorted(current, key=lambda asset: asset.registry_order)
 
+    def get_monitoring_assets(self, assets: Sequence[RwaAsset]) -> list[RwaAsset]:
+        """返回每日选出的后续 RPC 扫描资产。"""
+
+        selected = [asset for asset in assets if asset.monitoring_selected]
+        return sorted(selected, key=lambda asset: asset.registry_order)
+
+    def selection_summary(self) -> dict[str, object]:
+        """返回当前候选资产选择摘要。"""
+
+        return dict(self._selection_summary)
+
     def fetch_prices(self, symbols: Iterable[str]) -> dict[str, Decimal]:
         """读取指定 RWA 的官方中间价；临时错误最多重试三次。"""
 
         prices: dict[str, Decimal] = {}
         for symbol in sorted(set(symbols)):
-            last_error: BaseException | None = None
-            for attempt in range(PRICE_MAX_ATTEMPTS):
-                try:
-                    response = self.session.get(
-                        f"{ROBINHOOD_PRICES_URL}/{symbol}",
-                        timeout=20,
-                    )
-                    response.raise_for_status()
-                    payload = response.json()
-                    quotes = payload.get("quotes", []) if isinstance(payload, dict) else []
-                    quote = quotes[0] if isinstance(quotes, list) and quotes else {}
-                    if not isinstance(quote, dict):
-                        raise ValueError("quotes 格式无效")
-                    bid = _parse_decimal(quote.get("bid"))
-                    ask = _parse_decimal(quote.get("ask"))
-                    price = (bid + ask) / 2 if bid is not None and ask is not None else bid or ask
-                    if price is None:
-                        raise ValueError("bid/ask 缺失或无效")
-                    prices[symbol] = price
-                    break
-                except requests.HTTPError as error:
-                    last_error = error
-                    status_code = error.response.status_code if error.response is not None else 0
-                    if status_code not in PRICE_RETRYABLE_STATUS_CODES:
-                        break
-                except (requests.RequestException, ValueError, KeyError) as error:
-                    last_error = error
-
-                if attempt < PRICE_MAX_ATTEMPTS - 1:
-                    time.sleep(PRICE_RETRY_DELAYS_SECONDS[attempt])
-
+            quote = self._fetch_quote(symbol)
+            bid = _parse_decimal(quote.get("bid"))
+            ask = _parse_decimal(quote.get("ask"))
+            price = (bid + ask) / 2 if bid is not None and ask is not None else bid or ask
+            if price is not None:
+                prices[symbol] = price
             if symbol not in prices:
-                reason = type(last_error).__name__ if last_error is not None else "empty_quote"
-                logger.warning("无法读取 RWA 价格，相关 USD 指标将缺失: %s (%s)", symbol, reason)
+                logger.warning("无法读取 RWA 价格，相关 USD 指标将缺失: %s", symbol)
         return prices
 
 
@@ -451,7 +709,7 @@ class RobinhoodRwaUniswapMonitor:
         self.pool_start_block = pool_start_block
         self.native_price_usd = native_price_usd
         self.all_rwa_pairs = all_rwa_pairs
-        self.asset_scope = "all_active"
+        self.asset_scope = "daily_candidates"
         self.supabase = supabase_repository
         self.registry = RwaAssetRegistry(assets_path, session=session)
         self.session = self.registry.session
@@ -826,6 +1084,22 @@ class RobinhoodRwaUniswapMonitor:
         return format(value, "f") if value is not None else None
 
     @staticmethod
+    def _apply_current_multipliers(
+        prices: Mapping[str, Decimal],
+        assets: Sequence[RwaAsset],
+    ) -> dict[str, Decimal]:
+        """将 raw underlying 价格换算为 token-denominated 价格。"""
+
+        multipliers = {
+            asset.token_symbol: _parse_decimal(asset.current_multiplier) or Decimal("1")
+            for asset in assets
+        }
+        return {
+            symbol: price * multipliers.get(symbol, Decimal("1"))
+            for symbol, price in prices.items()
+        }
+
+    @staticmethod
     def _estimated_block_timestamp(
         block_number: int,
         latest_block: int,
@@ -995,12 +1269,20 @@ class RobinhoodRwaUniswapMonitor:
                 "token_name": asset.token_name,
                 "isin": asset.isin,
                 "token_decimals": asset.token_decimals,
+                "current_multiplier": asset.current_multiplier,
                 "status": asset.status,
                 "active": asset.active,
                 "registry_order": asset.registry_order,
                 "first_seen_at": asset.first_seen_at,
                 "last_seen_at": asset.last_seen_at,
                 "is_new_issue": asset.is_new_issue,
+                "is_new_asset": asset.is_new_asset,
+                "daily_trading_volume": asset.daily_trading_volume,
+                "volume_updated_at": asset.volume_updated_at,
+                "monitoring_selected": asset.monitoring_selected,
+                "monitoring_reason": asset.monitoring_reason,
+                "monitoring_rank": asset.monitoring_rank,
+                "updated_at": asset.last_seen_at,
             }
             for asset in assets
         )
@@ -1189,9 +1471,12 @@ class RobinhoodRwaUniswapMonitor:
     def _run_once(self) -> dict[str, object]:
         """同步资产、扫描池和交易，并写入 JSON/CSV 报告。"""
 
-        assets = self.registry.sync()
-        asset_rows = [asset.to_dict() for asset in assets]
-        new_issue_symbols = [asset.token_symbol for asset in assets if asset.is_new_issue]
+        all_assets = self.registry.sync()
+        assets = self.registry.get_monitoring_assets(all_assets)
+        asset_rows = [asset.to_dict() for asset in all_assets]
+        new_issue_symbols = [asset.token_symbol for asset in all_assets if asset.is_new_issue]
+        selection_summary = self.registry.selection_summary()
+        new_asset_symbols = list(selection_summary.get("new_asset_symbols", []))
         latest_block = self.analyzer.get_latest_block()
         latest_timestamp = self._block_timestamp(latest_block)
         pools = self.sync_pools(assets, latest_block)
@@ -1200,9 +1485,13 @@ class RobinhoodRwaUniswapMonitor:
                 "generated_at": _utc_now(),
                 "chain_id": ROBINHOOD_CHAIN_ID,
                 "latest_block": latest_block,
-                "active_asset_count": len(assets),
+                "active_asset_count": len(all_assets),
+                "monitoring_asset_count": len(assets),
                 "new_issue_count": len(new_issue_symbols),
                 "new_issue_symbols": new_issue_symbols,
+                "new_asset_count": len(new_asset_symbols),
+                "new_asset_symbols": new_asset_symbols,
+                "asset_selection": selection_summary,
                 "assets": asset_rows,
                 "asset_scope": self.asset_scope,
                 "rwa_pool_count": 0,
@@ -1248,10 +1537,10 @@ class RobinhoodRwaUniswapMonitor:
             for address in (pool.currency0, pool.currency1)
             if address.lower() in asset_by_address
         }
-        prices = self.registry.fetch_prices(symbols)
+        prices = self._apply_current_multipliers(self.registry.fetch_prices(symbols), assets)
         if self.supabase is not None:
             database_rows = self._publish_to_supabase(
-                assets,
+                all_assets,
                 pools,
                 swaps,
                 latest_block,
@@ -1277,9 +1566,13 @@ class RobinhoodRwaUniswapMonitor:
                 "rpc_endpoints": [mask_rpc_url(url) for url in self.rpc_urls],
                 "rpc_strategy": "round_robin_with_failover_on_rate_limit_or_temporary_error",
                 "rpc_scan_start_block": scan_start,
-                "active_asset_count": len(assets),
+                "active_asset_count": len(all_assets),
+                "monitoring_asset_count": len(assets),
                 "new_issue_count": len(new_issue_symbols),
                 "new_issue_symbols": new_issue_symbols,
+                "new_asset_count": len(new_asset_symbols),
+                "new_asset_symbols": new_asset_symbols,
+                "asset_selection": selection_summary,
                 "assets": asset_rows,
                 "asset_scope": self.asset_scope,
                 "rwa_pool_count": len(pools),
@@ -1288,8 +1581,8 @@ class RobinhoodRwaUniswapMonitor:
                 "swap_count": sum(int(row.get("swap_count", 0)) for row in active_database_rankings),
                 "windows_hours": list(WINDOW_HOURS),
                 "metric_definition": {
-                    "fee_income_usd": "按 Swap.fee 与输入 token 官方中间价估算的 core swap fee",
-                    "active_liquidity_usd_proxy": "Swap 状态按 sqrtPrice 的虚拟 reserves 换算的双边 USD 值",
+                    "fee_income_usd": "按 Swap.fee 与输入 token 官方中间价 × current_multiplier 估算的 core swap fee",
+                    "active_liquidity_usd_proxy": "Swap 状态按 sqrtPrice 的虚拟 reserves 和 current_multiplier 换算的双边 USD 值",
                     "window_yield_percent": "窗口手续费 / 当前 active liquidity USD proxy",
                     "annualized_yield_percent": "window_yield_percent × 365 × 24 / window_hours",
                     "ranking": "数据库按每个窗口 annualized_yield_percent 降序预计算",
@@ -1340,9 +1633,13 @@ class RobinhoodRwaUniswapMonitor:
             "latest_block_timestamp": datetime.fromtimestamp(latest_timestamp, tz=timezone.utc).isoformat(),
             "rpc_endpoints": [mask_rpc_url(url) for url in self.rpc_urls],
             "rpc_strategy": "round_robin_with_failover_on_rate_limit_or_temporary_error",
-            "active_asset_count": len(assets),
+            "active_asset_count": len(all_assets),
+            "monitoring_asset_count": len(assets),
             "new_issue_count": len(new_issue_symbols),
             "new_issue_symbols": new_issue_symbols,
+            "new_asset_count": len(new_asset_symbols),
+            "new_asset_symbols": new_asset_symbols,
+            "asset_selection": selection_summary,
             "assets": asset_rows,
             "asset_scope": self.asset_scope,
             "rwa_pool_count": len(pools),
@@ -1351,8 +1648,8 @@ class RobinhoodRwaUniswapMonitor:
             "swap_count": len(swaps),
             "windows_hours": list(WINDOW_HOURS),
             "metric_definition": {
-                "fee_income_usd": "按 Swap.fee 与输入 token 官方中间价估算的 core swap fee",
-                "active_liquidity_usd_proxy": "StateView active liquidity 按当前 sqrtPrice 的虚拟 reserves 换算的双边 USD 值",
+                "fee_income_usd": "按 Swap.fee 与输入 token 官方中间价 × current_multiplier 估算的 core swap fee",
+                "active_liquidity_usd_proxy": "StateView active liquidity 按当前 sqrtPrice 的虚拟 reserves 和 current_multiplier 换算的双边 USD 值",
                 "window_yield_percent": "窗口手续费 / 当前 active liquidity USD proxy",
                 "annualized_yield_percent": "window_yield_percent × 365 × 24 / window_hours",
                 "ranking": "每个窗口内按 annualized_yield_percent 降序；缺失 USD 数据排在最后",

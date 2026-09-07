@@ -10,6 +10,8 @@ create table if not exists public.rh_rwa_assets (
     token_name text not null,
     isin text,
     token_decimals smallint not null check (token_decimals between 0 and 255),
+    current_multiplier numeric(38, 18)
+        check (current_multiplier is null or current_multiplier > 0),
     status text not null,
     active boolean not null default true,
     registry_order integer not null default 0 check (registry_order >= 0),

@@ -88,7 +88,13 @@ class SupabaseRepository:
             response.raise_for_status()
         except requests.RequestException as error:
             status = error.response.status_code if error.response is not None else "unknown"
-            raise SupabaseRepositoryError(f"Supabase 请求失败: {method} {path}, HTTP {status}") from error
+            response_body = ""
+            if error.response is not None:
+                response_body = error.response.text.strip().replace("\n", " ")[:500]
+            detail = f", response={response_body}" if response_body else ""
+            raise SupabaseRepositoryError(
+                f"Supabase 请求失败: {method} {path}, HTTP {status}{detail}"
+            ) from error
         if not response.content:
             return None
         try:
